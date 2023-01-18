@@ -819,7 +819,7 @@ future<> gossiper::failure_detector_loop_for_node(gms::inet_address node, genera
                     node, _live_endpoints, _live_endpoints_version, live_endpoints_version);
             co_return;
         } else  {
-            co_await sleep_abortable(echo_interval, _abort_source);
+            co_await sleep_abortable(echo_interval, _abort_source).handle_exception_type([] (const abort_requested_exception&) {});
         }
     }
     co_return;
