@@ -781,7 +781,7 @@ future<> gossiper::failure_detector_loop_for_node(gms::inet_address node, genera
         tmr.cancel();
         canceller.cancel();
     });
-    while (is_enabled()) {
+    while (is_enabled() && !_abort_source.abort_requested()) {
         bool failed = false;
         try {
             logger.debug("failure_detector_loop: Send echo to node {}, status = started", node);
