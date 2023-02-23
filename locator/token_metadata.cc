@@ -19,8 +19,10 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <boost/range/adaptors.hpp>
+#include "seastar/core/smp.hh"
 #include "utils/stall_free.hh"
 #include "utils/fb_utilities.hh"
+#include "utils/overloaded_functor.hh"
 
 namespace locator {
 
@@ -101,8 +103,8 @@ public:
         return _bootstrap_tokens;
     }
 
-    void update_topology(inet_address ep, endpoint_dc_rack dr) {
-        _topology.update_endpoint(ep, std::move(dr));
+    void update_topology(inet_address ep, endpoint_dc_rack dr, std::optional<node::state> opt_st) {
+        _topology.update_endpoint(ep, std::move(dr), std::move(opt_st));
     }
 
     /**
@@ -151,9 +153,9 @@ public:
 
     void add_bootstrap_token(token t, inet_address endpoint);
 
-    void add_bootstrap_tokens(std::unordered_set<token> tokens, inet_address endpoint);
+    void add_bootstrap_tokens(const std::unordered_set<token>& tokens, inet_address endpoint);
 
-    void remove_bootstrap_tokens(std::unordered_set<token> tokens);
+    void remove_bootstrap_tokens(const std::unordered_set<token>& tokens);
 
     void add_leaving_endpoint(inet_address endpoint);
     void del_leaving_endpoint(inet_address endpoint);
@@ -302,6 +304,7 @@ public:
 
     void invalidate_cached_rings() {
         _ring_version = ++_static_ring_version;
+        tlogger.debug("ring_version={}", _ring_version);
     }
 
     friend class token_metadata;
@@ -474,9 +477,7 @@ future<> token_metadata_impl::update_normal_tokens(std::unordered_set<token> tok
 
 size_t token_metadata_impl::first_token_index(const token& start) const {
     if (_sorted_tokens.empty()) {
-        auto msg = format("sorted_tokens is empty in first_token_index!");
-        tlogger.error("{}", msg);
-        throw std::runtime_error(msg);
+        log_error_and_throw<std::runtime_error>(tlogger, "sorted_tokens is empty in first_token_index!");
     }
     auto it = std::lower_bound(_sorted_tokens.begin(), _sorted_tokens.end(), start);
     if (it == _sorted_tokens.end()) {
@@ -519,6 +520,7 @@ void token_metadata_impl::debug_show() const {
 }
 
 void token_metadata_impl::update_host_id(const host_id& host_id, inet_address endpoint) {
+    _topology.update_endpoint(endpoint, host_id);
     _endpoint_to_host_id_map[endpoint] = host_id;
 }
 
@@ -581,7 +583,7 @@ token_metadata_impl::ring_range(const std::optional<dht::partition_range::bound>
     return r;
 }
 
-void token_metadata_impl::add_bootstrap_tokens(std::unordered_set<token> tokens, inet_address endpoint) {
+void token_metadata_impl::add_bootstrap_tokens(const std::unordered_set<token>& tokens, inet_address endpoint) {
     for (auto t : tokens) {
         auto old_endpoint = _bootstrap_tokens.find(t);
         if (old_endpoint != _bootstrap_tokens.end() && (*old_endpoint).second != endpoint) {
@@ -598,12 +600,12 @@ void token_metadata_impl::add_bootstrap_tokens(std::unordered_set<token> tokens,
 
     std::erase_if(_bootstrap_tokens, [endpoint] (const std::pair<token, inet_address>& n) { return n.second == endpoint; });
 
-    for (auto t : tokens) {
+    for (const auto& t : tokens) {
         _bootstrap_tokens[t] = endpoint;
     }
 }
 
-void token_metadata_impl::remove_bootstrap_tokens(std::unordered_set<token> tokens) {
+void token_metadata_impl::remove_bootstrap_tokens(const std::unordered_set<token>& tokens) {
     if (tokens.empty()) {
         tlogger.warn("tokens is empty in remove_bootstrap_tokens!");
         return;
@@ -640,9 +642,7 @@ token token_metadata_impl::get_predecessor(token t) const {
     auto& tokens = sorted_tokens();
     auto it = std::lower_bound(tokens.begin(), tokens.end(), t);
     if (it == tokens.end() || *it != t) {
-        auto msg = format("token error in get_predecessor!");
-        tlogger.error("{}", msg);
-        throw std::runtime_error(msg);
+        log_error_and_throw<std::runtime_error>(tlogger, "token error in get_predecessor!");
     }
     if (it == tokens.begin()) {
         // If the token is the first element, its preprocessor is the last element
@@ -849,7 +849,7 @@ void token_metadata_impl::calculate_pending_ranges_for_bootstrap(
     for (auto& x : tmp) {
         auto& endpoint = x.first;
         auto& tokens = x.second;
-        all_left_metadata->update_topology(endpoint, get_dc_rack(endpoint));
+        all_left_metadata->update_topology(endpoint, get_dc_rack(endpoint), node::state::joining);
         all_left_metadata->update_normal_tokens(tokens, endpoint).get();
         auto address_ranges = strategy.get_ranges(endpoint, *all_left_metadata).get0();
         for (const dht::token_range& x : address_ranges) {
@@ -1022,8 +1022,8 @@ token_metadata::get_bootstrap_tokens() const {
 }
 
 void
-token_metadata::update_topology(inet_address ep, endpoint_dc_rack dr) {
-    _impl->update_topology(ep, std::move(dr));
+token_metadata::update_topology(inet_address ep, endpoint_dc_rack dr, std::optional<node::state> opt_st) {
+    _impl->update_topology(ep, std::move(dr), std::move(opt_st));
 }
 
 boost::iterator_range<token_metadata::tokens_iterator>
@@ -1043,6 +1043,11 @@ token_metadata::get_topology() {
 
 const topology&
 token_metadata::get_topology() const {
+    return _impl->get_topology();
+}
+
+topology&
+token_metadata::get_mutable_topology() const {
     return _impl->get_topology();
 }
 
@@ -1071,10 +1076,9 @@ token_metadata::get_endpoint_for_host_id(host_id host_id) const {
     return _impl->get_endpoint_for_host_id(host_id);
 }
 
-host_id_or_endpoint token_metadata::parse_host_id_and_endpoint(const sstring& host_id_string) const {
+node_ptr token_metadata::parse_host_id_and_endpoint(const sstring& host_id_string) const {
     auto res = host_id_or_endpoint(host_id_string);
-    res.resolve(*this);
-    return res;
+    return res.resolve(get_topology());
 }
 
 const std::unordered_map<inet_address, host_id>&
@@ -1088,13 +1092,13 @@ token_metadata::add_bootstrap_token(token t, inet_address endpoint) {
 }
 
 void
-token_metadata::add_bootstrap_tokens(std::unordered_set<token> tokens, inet_address endpoint) {
-    _impl->add_bootstrap_tokens(std::move(tokens), endpoint);
+token_metadata::add_bootstrap_tokens(const std::unordered_set<token>& tokens, inet_address endpoint) {
+    _impl->add_bootstrap_tokens(tokens, endpoint);
 }
 
 void
-token_metadata::remove_bootstrap_tokens(std::unordered_set<token> tokens) {
-    _impl->remove_bootstrap_tokens(std::move(tokens));
+token_metadata::remove_bootstrap_tokens(const std::unordered_set<token>& tokens) {
+    _impl->remove_bootstrap_tokens(tokens);
 }
 
 void
@@ -1253,28 +1257,54 @@ future<> shared_token_metadata::mutate_token_metadata(seastar::noncopyable_funct
     set(make_token_metadata_ptr(std::move(tm)));
 }
 
+future<> shared_token_metadata::mutate_on_all_shards(sharded<shared_token_metadata>& stm, seastar::noncopyable_function<future<> (token_metadata&)> func) {
+    auto base_shard = this_shard_id();
+    assert(base_shard == 0);
+    auto lk = co_await stm.local().get_lock();
+
+    std::vector<mutable_token_metadata_ptr> pending_token_metadata_ptr;
+    pending_token_metadata_ptr.resize(smp::count);
+    auto tmptr = make_token_metadata_ptr(co_await stm.local().get()->clone_async());
+    auto& tm = *tmptr;
+    // bump the token_metadata ring_version
+    // to invalidate cached token/replication mappings
+    // when the modified token_metadata is committed.
+    tm.invalidate_cached_rings();
+    co_await func(tm);
+
+    // Apply the mutated token_metadata only after successfully cloning it on all shards.
+    pending_token_metadata_ptr[base_shard] = tmptr;
+    co_await smp::invoke_on_others(base_shard, [&] () -> future<> {
+        pending_token_metadata_ptr[this_shard_id()] = make_token_metadata_ptr(co_await tm.clone_async());
+    });
+
+    co_await stm.invoke_on_all([&] (shared_token_metadata& stm) {
+        stm.set(std::move(pending_token_metadata_ptr[this_shard_id()]));
+    });
+}
+
 host_id_or_endpoint::host_id_or_endpoint(const sstring& s, param_type restrict) {
     switch (restrict) {
     case param_type::host_id:
         try {
-            id = host_id(utils::UUID(s));
+            data = host_id(utils::UUID(s));
         } catch (const marshal_exception& e) {
             throw std::invalid_argument(format("Invalid host_id {}: {}", s, e.what()));
         }
         break;
     case param_type::endpoint:
         try {
-            endpoint = gms::inet_address(s);
+            data = gms::inet_address(s);
         } catch (std::invalid_argument& e) {
             throw std::invalid_argument(format("Invalid inet_address {}: {}", s, e.what()));
         }
         break;
     case param_type::auto_detect:
         try {
-            id = host_id(utils::UUID(s));
+            data = host_id(utils::UUID(s));
         } catch (const marshal_exception& e) {
             try {
-                endpoint = gms::inet_address(s);
+                data = gms::inet_address(s);
             } catch (std::invalid_argument& e) {
                 throw std::invalid_argument(format("Invalid host_id or inet_address {}", s));
             }
@@ -1282,20 +1312,23 @@ host_id_or_endpoint::host_id_or_endpoint(const sstring& s, param_type restrict) 
     }
 }
 
-void host_id_or_endpoint::resolve(const token_metadata& tm) {
-    if (id) {
-        auto endpoint_opt = tm.get_endpoint_for_host_id(id);
-        if (!endpoint_opt) {
-            throw std::runtime_error(format("Host ID {} not found in the cluster", id));
-        }
-        endpoint = *endpoint_opt;
-    } else {
-        auto opt_id = tm.get_host_id_if_known(endpoint);
-        if (!opt_id) {
-            throw std::runtime_error(format("Host inet address {} not found in the cluster", endpoint));
-        }
-        id = *opt_id;
-    }
+node_ptr host_id_or_endpoint::resolve(const topology& topo) {
+    node_ptr node;
+    std::visit(overloaded_functor {
+        [&] (const host_id& id) {
+            node = topo.find_node(id);
+            if (!node) {
+                throw std::runtime_error(format("Host ID {} not found in the cluster", id));
+            }
+        },
+        [&] (const inet_address& endpoint) {
+            node = topo.find_node(endpoint);
+            if (!node) {
+                throw std::runtime_error(format("Host inet address {} not found in the cluster", endpoint));
+            }
+        },
+    }, data);
+    return node;
 }
 
 } // namespace locator

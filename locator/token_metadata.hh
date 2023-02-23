@@ -23,6 +23,7 @@
 #include "range.hh"
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/semaphore.hh>
+#include <seastar/core/sharded.hh>
 
 #include "locator/types.hh"
 #include "locator/topology.hh"
@@ -41,8 +42,7 @@ using token = dht::token;
 class token_metadata;
 
 struct host_id_or_endpoint {
-    host_id id;
-    gms::inet_address endpoint;
+    std::variant<host_id, gms::inet_address> data;
 
     enum class param_type {
         host_id,
@@ -53,16 +53,29 @@ struct host_id_or_endpoint {
     host_id_or_endpoint(const sstring& s, param_type restrict = param_type::auto_detect);
 
     bool has_host_id() const noexcept {
-        return bool(id);
+        return data.index() == 0;
     }
 
     bool has_endpoint() const noexcept {
-        return endpoint != gms::inet_address();
+        return data.index() == 1;
+    }
+
+    host_id id() const {
+        return std::get<host_id>(data);
+    }
+
+    gms::inet_address endpoint() const {
+        return std::get<gms::inet_address>(data);
     }
 
     // Map the host_id to endpoint based on whichever of them is set,
     // using the token_metadata
-    void resolve(const token_metadata& tm);
+    node_ptr resolve(const topology& topo);
+};
+
+struct host_id_and_endpoint {
+    locator::host_id host_id;
+    gms::inet_address endpoint;
 };
 
 class token_metadata_impl;
@@ -116,7 +129,11 @@ public:
     const std::unordered_map<token, inet_address>& get_token_to_endpoint() const;
     const std::unordered_set<inet_address>& get_leaving_endpoints() const;
     const std::unordered_map<token, inet_address>& get_bootstrap_tokens() const;
-    void update_topology(inet_address ep, endpoint_dc_rack dr);
+
+    /**
+     * Update or add endpoint given its inet_address and endpoint_dc_rack.
+     */
+    void update_topology(inet_address ep, endpoint_dc_rack dr, std::optional<node::state> opt_st = std::nullopt);
     /**
      * Creates an iterable range of the sorted tokens starting at the token next
      * after the given one.
@@ -131,6 +148,7 @@ public:
 
     topology& get_topology();
     const topology& get_topology() const;
+    topology& get_mutable_topology() const;
     void debug_show() const;
 
     /**
@@ -153,16 +171,16 @@ public:
 
     /// Parses the \c host_id_string either as a host uuid or as an ip address and returns the mapping.
     /// Throws std::invalid_argument on parse error or std::runtime_error if the host_id wasn't found.
-    host_id_or_endpoint parse_host_id_and_endpoint(const sstring& host_id_string) const;
+    node_ptr parse_host_id_and_endpoint(const sstring& host_id_string) const;
 
     /** @return a copy of the endpoint-to-id map for read-only operations */
     const std::unordered_map<inet_address, host_id>& get_endpoint_to_host_id_map_for_reading() const;
 
     void add_bootstrap_token(token t, inet_address endpoint);
 
-    void add_bootstrap_tokens(std::unordered_set<token> tokens, inet_address endpoint);
+    void add_bootstrap_tokens(const std::unordered_set<token>& tokens, inet_address endpoint);
 
-    void remove_bootstrap_tokens(std::unordered_set<token> tokens);
+    void remove_bootstrap_tokens(const std::unordered_set<token>& tokens);
 
     void add_leaving_endpoint(inet_address endpoint);
     void del_leaving_endpoint(inet_address endpoint);
@@ -317,7 +335,7 @@ public:
         return _lock_func();
     }
 
-    // mutate_token_metadata acquires the shared_token_metadata lock,
+    // mutate_token_metadata_on_all_shards acquires the shared_token_metadata lock,
     // clones the token_metadata (using clone_async)
     // and calls an asynchronous functor on
     // the cloned copy of the token_metadata to mutate it.
@@ -326,6 +344,18 @@ public:
     // is set back to to the shared_token_metadata,
     // otherwise, the clone is destroyed.
     future<> mutate_token_metadata(seastar::noncopyable_function<future<> (token_metadata&)> func);
+
+    // mutate_token_metadata_on_all_shards acquires the shared_token_metadata lock,
+    // clones the token_metadata (using clone_async)
+    // and calls an asynchronous functor on
+    // the cloned copy of the token_metadata to mutate it.
+    //
+    // If the functor is successful, the mutated clone
+    // is set back to to the shared_token_metadata on all shards,
+    // otherwise, the clone is destroyed.
+    //
+    // Must be called on shard 0.
+    static future<> mutate_on_all_shards(sharded<shared_token_metadata>& stm, seastar::noncopyable_function<future<> (token_metadata&)> func);
 };
 
 }

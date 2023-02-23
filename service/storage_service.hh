@@ -104,7 +104,7 @@ public:
     explicit node_ops_meta_data(
             node_ops_id ops_uuid,
             gms::inet_address coordinator,
-            std::list<gms::inet_address> ignore_nodes,
+            locator::node_set ignore_nodes,
             std::function<future<> ()> abort_func,
             std::function<void ()> signal_func);
     shared_ptr<node_ops_info> get_ops_info();
@@ -301,7 +301,7 @@ private:
     void run_replace_ops(std::unordered_set<token>& bootstrap_tokens, replacement_info replace_info);
     void run_bootstrap_ops(std::unordered_set<token>& bootstrap_tokens);
 
-    std::list<gms::inet_address> get_ignore_dead_nodes_for_replace(const locator::token_metadata& tm);
+    locator::node_set get_ignore_dead_nodes_for_replace(const locator::token_metadata& tm);
     future<> wait_for_ring_to_settle(std::chrono::milliseconds delay);
 
 public:
@@ -583,12 +583,12 @@ private:
      *
      * @param endpoint the node that left
      */
-    future<> restore_replica_count(inet_address endpoint, inet_address notify_endpoint);
-    future<> removenode_with_stream(gms::inet_address leaving_node, shared_ptr<abort_source> as_ptr);
-    future<> removenode_add_ranges(lw_shared_ptr<dht::range_streamer> streamer, gms::inet_address leaving_node);
+    future<> restore_replica_count(locator::node_ptr leaving_node, locator::node_ptr notify_node);
+    future<> removenode_with_stream(locator::node_ptr leaving_node, shared_ptr<abort_source> as_ptr);
+    future<> removenode_add_ranges(lw_shared_ptr<dht::range_streamer> streamer, locator::node_ptr leaving_node);
 
     // needs to be modified to accept either a keyspace or ARS.
-    future<std::unordered_multimap<dht::token_range, inet_address>> get_changed_ranges_for_leaving(locator::effective_replication_map_ptr erm, inet_address endpoint);
+    future<std::unordered_multimap<dht::token_range, inet_address>> get_changed_ranges_for_leaving(locator::effective_replication_map_ptr erm, locator::node_ptr leaving_node);
 
     future<> maybe_reconnect_to_preferred_ip(inet_address ep, inet_address local_ip);
 public:
@@ -697,6 +697,7 @@ public:
     future<> removenode(locator::host_id host_id, std::list<locator::host_id_or_endpoint> ignore_nodes);
     future<node_ops_cmd_response> node_ops_cmd_handler(gms::inet_address coordinator, node_ops_cmd_request req);
     void node_ops_cmd_check(gms::inet_address coordinator, const node_ops_cmd_request& req);
+    future<> node_ops_cmd_heartbeat_updater(node_ops_cmd cmd, node_ops_id uuid, std::unordered_set<locator::node_ptr> nodes, lw_shared_ptr<bool> heartbeat_updater_done);
     future<> node_ops_cmd_heartbeat_updater(node_ops_cmd cmd, node_ops_id uuid, std::list<gms::inet_address> nodes, lw_shared_ptr<bool> heartbeat_updater_done);
 
     future<mode> get_operation_mode();

@@ -87,10 +87,10 @@ class node_ops_info {
 public:
     node_ops_id ops_uuid;
     shared_ptr<abort_source> as;
-    std::list<gms::inet_address> ignore_nodes;
+    locator::node_set ignore_nodes;
 
 public:
-    node_ops_info(node_ops_id ops_uuid_, shared_ptr<abort_source> as_, std::list<gms::inet_address>&& ignore_nodes_) noexcept;
+    node_ops_info(node_ops_id ops_uuid_, shared_ptr<abort_source> as_, locator::node_set&& ignore_nodes_) noexcept;
     node_ops_info(const node_ops_info&) = delete;
     node_ops_info(node_ops_info&&) = delete;
 
@@ -290,21 +290,55 @@ struct node_ops_cmd_request {
     std::unordered_map<gms::inet_address, std::list<dht::token>> bootstrap_nodes;
     // Optional field, list uuids of tables being repaired, set by repair cmd
     std::list<table_id> repair_tables;
+
+    // v2
+    std::unordered_map<locator::node::idx_type, locator::host_id_and_endpoint> nodes_dict;
+
+    node_ops_cmd_request(node_ops_cmd command,
+            node_ops_id uuid,
+            std::list<table_id> tables)
+        : cmd(command)
+        , ops_uuid(std::move(uuid))
+        , repair_tables(std::move(tables)) {
+    }
+
     node_ops_cmd_request(node_ops_cmd command,
             node_ops_id uuid,
             std::list<gms::inet_address> ignore = {},
             std::list<gms::inet_address> leaving = {},
             std::unordered_map<gms::inet_address, gms::inet_address> replace = {},
             std::unordered_map<gms::inet_address, std::list<dht::token>> bootstrap = {},
-            std::list<table_id> tables = {})
+            std::list<table_id> tables = {},
+            std::unordered_map<locator::node::idx_type, locator::host_id_and_endpoint> dict = {})
         : cmd(command)
         , ops_uuid(std::move(uuid))
         , ignore_nodes(std::move(ignore))
         , leaving_nodes(std::move(leaving))
         , replace_nodes(std::move(replace))
         , bootstrap_nodes(std::move(bootstrap))
-        , repair_tables(std::move(tables)) {
+        , repair_tables(std::move(tables))
+        , nodes_dict(std::move(dict))
+    {
     }
+
+    using enable_v2 = bool_class<struct enable_v2_tag>;
+
+    static node_ops_cmd_request make_node_ops_cmd_request(node_ops_cmd cmd,
+            node_ops_id uuid,
+            enable_v2 v2,
+            locator::node_set ignore_nodes = {},
+            locator::node_ptr leaving_node = nullptr,
+            std::unordered_map<locator::node_ptr, locator::node_ptr> replace_nodes = {},
+            std::unordered_map<locator::node_ptr, std::list<dht::token>> bootstrap_nodes = {},
+            std::list<table_id> tables = {});
+
+    locator::node_set get_ignore_nodes(const locator::topology& topo);
+    locator::node_set get_leaving_nodes(const locator::topology& topo);
+    std::unordered_map<locator::node_ptr, locator::node_ptr> get_replace_nodes(const locator::topology& topo);
+    // May update topology for replacing nodes
+    std::unordered_map<locator::node_ptr, locator::node_ptr> get_replace_nodes(locator::topology& topo, const gms::gossiper& gossiper);
+    // May update topology for bootstrap nodes
+    std::unordered_map<locator::node_ptr, std::unordered_set<dht::token>> get_bootstrap_nodes(locator::topology& topo, const gms::gossiper& gossiper);
 };
 
 struct node_ops_cmd_response {

@@ -30,11 +30,10 @@ private:
     uint32_t _cpuid;
 public:
     tester(netw::messaging_service& ms_) : ms(ms_) {}
-    using msg_addr = netw::messaging_service::msg_addr;
     using inet_address = gms::inet_address;
     using endpoint_state = gms::endpoint_state;
-    msg_addr get_msg_addr() {
-        return msg_addr{_server, _cpuid};
+    netw::msg_addr get_msg_addr() {
+        return netw::msg_addr{_server, _cpuid};
     }
     void set_server_ip(sstring ip) {
         _server = inet_address(ip);
@@ -174,6 +173,7 @@ int main(int ac, char ** av) {
         }
         const gms::inet_address listen = gms::inet_address(config["listen-address"].as<std::string>());
         utils::fb_utilities::set_broadcast_address(listen);
+        utils::fb_utilities::set_host_id(locator::host_id::create_random_id());
         seastar::sharded<netw::messaging_service> messaging;
         return messaging.start(listen).then([config, api_port, stay_alive, &messaging] () {
             auto testers = new distributed<tester>;

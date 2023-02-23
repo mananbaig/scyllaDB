@@ -7,6 +7,7 @@
  */
 
 #include "repair.hh"
+#include "locator/token_metadata.hh"
 #include "repair/row_level.hh"
 
 #include "mutation/atomic_cell_hash.hh"
@@ -25,6 +26,7 @@
 #include "service/migration_manager.hh"
 #include "partition_range_compat.hh"
 #include "gms/feature_service.hh"
+#include "log.hh"
 
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/algorithm/string/split.hpp>
@@ -33,7 +35,9 @@
 #include <boost/range/algorithm.hpp>
 #include <boost/range/algorithm_ext.hpp>
 #include <boost/range/adaptor/map.hpp>
+#include <boost/range/adaptor/transformed.hpp>
 
+#include <boost/range/iterator_range_core.hpp>
 #include <seastar/core/gate.hh>
 #include <seastar/util/defer.hh>
 #include <seastar/core/metrics_registration.hh>
@@ -49,7 +53,7 @@
 
 logging::logger rlogger("repair");
 
-node_ops_info::node_ops_info(node_ops_id ops_uuid_, shared_ptr<abort_source> as_, std::list<gms::inet_address>&& ignore_nodes_) noexcept
+node_ops_info::node_ops_info(node_ops_id ops_uuid_, shared_ptr<abort_source> as_, locator::node_set&& ignore_nodes_) noexcept
     : ops_uuid(ops_uuid_)
     , as(std::move(as_))
     , ignore_nodes(std::move(ignore_nodes_))
@@ -57,10 +61,235 @@ node_ops_info::node_ops_info(node_ops_id ops_uuid_, shared_ptr<abort_source> as_
 
 void node_ops_info::check_abort() {
     if (as && as->abort_requested()) {
-        auto msg = format("Node operation with ops_uuid={} is aborted", ops_uuid);
-        rlogger.warn("{}", msg);
-        throw std::runtime_error(msg);
+        log_warning_and_throw<std::runtime_error>(rlogger, "Node operation with ops_uuid={} is aborted", ops_uuid);
     }
+}
+
+node_ops_cmd_request node_ops_cmd_request::make_node_ops_cmd_request(node_ops_cmd cmd,
+        node_ops_id uuid,
+        enable_v2 v2,
+        locator::node_set ignore_nodes,
+        locator::node_ptr leaving_node,
+        std::unordered_map<locator::node_ptr, locator::node_ptr> replace_nodes,
+        std::unordered_map<locator::node_ptr, std::list<dht::token>> bootstrap_nodes,
+        std::list<table_id> tables) {
+    auto req = node_ops_cmd_request(cmd, uuid, std::move(tables));
+    std::unordered_map<locator::node::idx_type, locator::node_ptr> dict;
+
+    auto get_endpoint = [v2, &dict] (const locator::node_ptr& node) {
+        if (v2) {
+            auto idx = node->idx();
+            dict.try_emplace(idx, node);
+            return gms::inet_address(idx);
+        }
+        return node->endpoint();
+    };
+
+    req.ignore_nodes = boost::copy_range<std::list<gms::inet_address>>(ignore_nodes
+            | boost::adaptors::transformed([&] (const locator::node_ptr& node) { return get_endpoint(node); }));
+    if (leaving_node) {
+        req.leaving_nodes.emplace_back(get_endpoint(leaving_node));
+    }
+    for (const auto& [replaced_node, replacing_node] : replace_nodes) {
+        req.replace_nodes.emplace(get_endpoint(replaced_node), get_endpoint(replacing_node));
+    }
+    for (auto& [node, tokens] : bootstrap_nodes) {
+        req.bootstrap_nodes.emplace(get_endpoint(node), std::move(tokens));
+    }
+    if (v2) {
+        for (const auto& [idx, node] : dict) {
+            req.nodes_dict.emplace(idx, locator::host_id_and_endpoint{node->host_id(), node->endpoint()});
+        }
+    }
+    return req;
+}
+
+locator::node_set node_ops_cmd_request::get_ignore_nodes(const locator::topology& topo) {
+    locator::node_set ret;
+    if (!nodes_dict.empty()) {
+        for (const auto& x : ignore_nodes) {
+            auto haep = nodes_dict.at(x.raw_addr());
+            auto node = topo.find_node(haep.host_id);
+            if (!node) {
+                log_error_and_throw<std::runtime_error>(rlogger, "Ignore node {}/{} not found in topology", haep.host_id, haep.endpoint);
+            }
+            ret.emplace(std::move(node));
+        }
+    } else {
+        for (const auto& ep : ignore_nodes) {
+            auto node = topo.find_node(ep);
+            if (!node) {
+                log_error_and_throw<std::runtime_error>(rlogger, "Ignore node {} not found in topology", ep);
+            }
+            ret.emplace(std::move(node));
+        }
+    }
+    return ret;
+}
+
+locator::node_set node_ops_cmd_request::get_leaving_nodes(const locator::topology& topo) {
+    locator::node_set ret;
+    if (!nodes_dict.empty()) {
+        for (const auto& x : leaving_nodes) {
+            auto haep = nodes_dict.at(x.raw_addr());
+            auto node = topo.find_node(haep.host_id);
+            if (!node) {
+                log_error_and_throw<std::runtime_error>(rlogger, "Leaving node {}/{} not found in topology", haep.host_id, haep.endpoint);
+            }
+            ret.emplace(std::move(node));
+        }
+    } else {
+        for (const auto& ep : leaving_nodes) {
+            auto node = topo.find_node(ep);
+            if (!node) {
+                log_error_and_throw<std::runtime_error>(rlogger, "Leaving node {} not found in topology", ep);
+            }
+            ret.emplace(std::move(node));
+        }
+    }
+    return ret;
+}
+
+std::unordered_map<locator::node_ptr, locator::node_ptr> node_ops_cmd_request::get_replace_nodes(const locator::topology& topo) {
+    std::unordered_map<locator::node_ptr, locator::node_ptr> ret;
+    for (auto&& [x, y] : std::move(replace_nodes)) {
+        locator::host_id_and_endpoint replaced_haep, replacing_haep;
+        locator::node_ptr replaced_node, replacing_node;
+        if (!nodes_dict.empty()) {
+            replaced_haep = nodes_dict.at(x.raw_addr());
+            replaced_node = topo.find_node(replaced_haep.host_id);
+            replacing_haep = nodes_dict.at(y.raw_addr());
+            replacing_node = topo.find_node(replacing_haep.host_id);
+        } else {
+            replaced_haep.endpoint = x;
+            replaced_node = topo.find_node(replaced_haep.endpoint);
+            replacing_haep.endpoint = y;
+            replacing_node = topo.find_node(replacing_haep.endpoint);
+        }
+        if (!replaced_node) {
+            log_error_and_throw<std::runtime_error>(rlogger, "Replaced node {}/{} not found in topology", replaced_haep.host_id, replaced_haep.endpoint);
+        }
+        if (!replaced_node) {
+            log_error_and_throw<std::runtime_error>(rlogger, "Replacing node {}/{} not found in topology", replacing_haep.host_id, replacing_haep.endpoint);
+        }
+        ret.emplace(replaced_node, replacing_node);
+    }
+    return ret;
+}
+
+static locator::node_ptr add_node(locator::topology& topo, const gms::gossiper& gossiper, const locator::host_id_and_endpoint& haep, locator::node::state state) {
+    auto* dc = gossiper.get_application_state_ptr(haep.endpoint, gms::application_state::DC);
+    auto* rack = gossiper.get_application_state_ptr(haep.endpoint, gms::application_state::RACK);
+    auto dc_rack = locator::endpoint_dc_rack{
+        .dc = dc ? dc->value : locator::endpoint_dc_rack::default_location.dc,
+        .rack = (dc && rack) ? rack->value : locator::endpoint_dc_rack::default_location.rack,
+    };
+    return topo.add_node(haep.host_id, haep.endpoint, dc_rack, state);
+}
+
+std::unordered_map<locator::node_ptr, locator::node_ptr> node_ops_cmd_request::get_replace_nodes(locator::topology& topo, const gms::gossiper& gossiper) {
+    std::unordered_map<locator::node_ptr, locator::node_ptr> ret;
+    auto local_node = topo.local_node();
+    for (auto&& [x, y] : std::move(replace_nodes)) {
+        locator::host_id_and_endpoint replaced_haep, replacing_haep;
+        if (!nodes_dict.empty()) {
+            replaced_haep = nodes_dict.at(x.raw_addr());
+            replacing_haep = nodes_dict.at(y.raw_addr());
+        } else {
+            replaced_haep.endpoint = x;
+            auto* s = gossiper.get_application_state_ptr(replaced_haep.endpoint, gms::application_state::HOST_ID);
+            if (s) {
+                replaced_haep.host_id = locator::host_id(utils::UUID(s->value));
+                if (replaced_haep.host_id == local_node->host_id()) {
+                    on_internal_error(rlogger, format("Replaced node {} has same host_id in gossip as the local node {}", replaced_haep.endpoint, local_node));
+                }
+            } else {
+                on_internal_error(rlogger, format("No Host ID found for replaced node {}", replaced_haep.endpoint));
+            }
+            replacing_haep.endpoint = y;
+            // when replacing nodes with same ip address
+            // we get to the replacing node via topo.local_node()
+            if (replacing_haep.endpoint != replaced_haep.endpoint) {
+                s = gossiper.get_application_state_ptr(replacing_haep.endpoint, gms::application_state::HOST_ID);
+                if (s) {
+                    replacing_haep.host_id = locator::host_id(utils::UUID(s->value));
+                }
+            }
+        }
+
+        locator::node_ptr replaced_node;
+        if (replaced_haep.host_id) {
+            replaced_node = topo.find_node(replaced_haep.host_id);
+        } else {
+            replaced_node = topo.find_node(replaced_haep.endpoint);
+        }
+        if (replaced_node) {
+            replaced_node = topo.update_node(replaced_node, std::nullopt, std::nullopt, std::nullopt, locator::node::state::leaving);
+        } else {
+            replaced_node = add_node(topo, gossiper, replaced_haep, locator::node::state::leaving);
+        }
+
+        locator::node_ptr replacing_node;
+        if (replacing_haep.host_id) {
+            replacing_node = topo.find_node(replacing_haep.host_id);
+        } else if (replacing_haep.endpoint == utils::fb_utilities::get_broadcast_address()) {
+            replacing_node = local_node;
+        }
+        if (!replacing_node) {
+            if (replacing_haep.endpoint != replaced_haep.endpoint) {
+                replacing_node = topo.find_node(replacing_haep.endpoint);
+                if (replacing_node && !replacing_node->host_id() && replacing_haep.host_id) {
+                    replacing_node = topo.update_node(replacing_node, replacing_haep.host_id, std::nullopt, std::nullopt, locator::node::state::joining);
+                }
+            }
+            if (!replacing_node) {
+                replacing_node = add_node(topo, gossiper, replacing_haep, locator::node::state::joining);
+            }
+        }
+
+        ret.emplace(replaced_node, replacing_node);
+    }
+    return ret;
+}
+
+std::unordered_map<locator::node_ptr, std::unordered_set<dht::token>> node_ops_cmd_request::get_bootstrap_nodes(locator::topology& topo, const gms::gossiper& gossiper) {
+    std::unordered_map<locator::node_ptr, std::unordered_set<dht::token>> ret;
+    for (auto&& [x, tokens_list] : std::move(bootstrap_nodes)) {
+        locator::host_id_and_endpoint haep;
+        locator::node_ptr node;
+        if (!nodes_dict.empty()) {
+            haep = nodes_dict.at(x.raw_addr());
+        } else {
+            haep.endpoint = x;
+            auto *s = gossiper.get_application_state_ptr(haep.endpoint, gms::application_state::HOST_ID);
+            if (s) {
+                haep.host_id = locator::host_id(utils::UUID(s->value));
+            }
+        }
+        if (haep.host_id) {
+            node = topo.find_node(haep.host_id);
+        }
+        if (!node) {
+            node = topo.find_node(haep.endpoint);
+            if (node) {
+                if (node->host_id() != haep.host_id) {
+                    if (!node->host_id()) {
+                        node = topo.update_node(node, haep.host_id, std::nullopt, std::nullopt, locator::node::state::joining);
+                    } else {
+                        on_internal_error(rlogger, format("Bootstrap node {}/{}: found mismatching node {}", haep.host_id, haep.endpoint, node));
+                    }
+                }
+            } else {
+                node = add_node(topo, gossiper, haep, locator::node::state::joining);
+            }
+        }
+        std::unordered_set<dht::token> tokens;
+        for (auto&& t : std::move(tokens_list)) {
+            tokens.emplace(std::move(t));
+        }
+        ret.emplace(std::move(node), std::move(tokens));
+    }
+    return ret;
 }
 
 node_ops_metrics::node_ops_metrics(shared_ptr<repair_module> module)
@@ -182,7 +411,7 @@ static std::vector<gms::inet_address> get_neighbors(
         const sstring& ksname, query::range<dht::token> range,
         const std::vector<sstring>& data_centers,
         const std::vector<sstring>& hosts,
-        const std::unordered_set<gms::inet_address>& ignore_nodes) {
+        const locator::node_set& ignore_nodes) {
     dht::token tok = range.end() ? range.end()->value() : dht::maximum_token();
     auto ret = erm.get_natural_endpoints(tok);
     remove_item(ret, utils::fb_utilities::get_broadcast_address());
@@ -262,7 +491,7 @@ static std::vector<gms::inet_address> get_neighbors(
         }
     } else if (!ignore_nodes.empty()) {
         auto it = std::remove_if(ret.begin(), ret.end(), [&ignore_nodes] (const gms::inet_address& node) {
-            return ignore_nodes.contains(node);
+            return locator::contains_endpoint(ignore_nodes, node);
         });
         ret.erase(it, ret.end());
     }
@@ -299,7 +528,7 @@ static future<std::list<gms::inet_address>> get_hosts_participating_in_repair(
         const dht::token_range_vector& ranges,
         const std::vector<sstring>& data_centers,
         const std::vector<sstring>& hosts,
-        const std::unordered_set<gms::inet_address>& ignore_nodes) {
+        const locator::node_set& ignore_nodes) {
 
     std::unordered_set<gms::inet_address> participating_hosts;
 
@@ -534,7 +763,7 @@ shard_repair_task_impl::shard_repair_task_impl(tasks::task_manager::module_ptr m
         repair_uniq_id parent_id_,
         const std::vector<sstring>& data_centers_,
         const std::vector<sstring>& hosts_,
-        const std::unordered_set<gms::inet_address>& ignore_nodes_,
+        locator::node_set ignore_nodes_,
         streaming::stream_reason reason_,
         bool hints_batchlog_flushed)
     : repair_task_impl(module, id, 0, keyspace, "", "", parent_id_.uuid(), reason_)
@@ -553,7 +782,7 @@ shard_repair_task_impl::shard_repair_task_impl(tasks::task_manager::module_ptr m
     , id(parent_id_)
     , data_centers(data_centers_)
     , hosts(hosts_)
-    , ignore_nodes(ignore_nodes_)
+    , ignore_nodes(std::move(ignore_nodes_))
     , total_rf(erm->get_replication_factor())
     , nr_ranges_total(ranges.size())
     , _hints_batchlog_flushed(std::move(hints_batchlog_flushed))
@@ -970,7 +1199,8 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
     auto& db = sharded_db.local();
     auto germs = make_lw_shared(co_await locator::make_global_effective_replication_map(sharded_db, keyspace));
     auto& erm = germs->get();
-    auto& topology = erm.get_token_metadata().get_topology();
+    auto& tm = erm.get_token_metadata();
+    auto& topology = tm.get_topology();
 
     repair_options options(options_map);
 
@@ -1026,11 +1256,10 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
     if (!options.ignore_nodes.empty() && !options.hosts.empty()) {
         throw std::runtime_error("Cannot combine ignore_nodes and hosts options.");
     }
-    std::unordered_set<gms::inet_address> ignore_nodes;
+    locator::node_set ignore_nodes;
     for (const auto& n: options.ignore_nodes) {
         try {
-            auto node = gms::inet_address(n);
-            ignore_nodes.insert(node);
+            ignore_nodes.insert(tm.parse_host_id_and_endpoint(n));
         } catch(...) {
             throw std::runtime_error(format("Failed to parse node={} in ignore_nodes={} specified by user: {}",
                 n, options.ignore_nodes, std::current_exception()));
@@ -1107,7 +1336,7 @@ future<> user_requested_repair_task_impl::run() {
         if (needs_flush_before_repair) {
             auto waiting_nodes = db.get_token_metadata().get_all_endpoints();
             std::erase_if(waiting_nodes, [&] (const auto& addr) {
-                return ignore_nodes.contains(addr);
+                return locator::contains_endpoint(ignore_nodes, addr);
             });
             auto hints_timeout = std::chrono::seconds(300);
             auto batchlog_timeout = std::chrono::seconds(300);
@@ -1142,7 +1371,7 @@ future<> user_requested_repair_task_impl::run() {
         abort_source as;
         auto off_strategy_updater = seastar::async([&rs, uuid = uuid.uuid(), &table_ids, &participants, &as] {
             auto tables = std::list<table_id>(table_ids.begin(), table_ids.end());
-            auto req = node_ops_cmd_request(node_ops_cmd::repair_updater, node_ops_id{uuid}, {}, {}, {}, {}, std::move(tables));
+            auto req = node_ops_cmd_request(node_ops_cmd::repair_updater, node_ops_id{uuid}, std::move(tables));
             auto update_interval = std::chrono::seconds(30);
             while (!as.abort_requested()) {
                 sleep_abortable(update_interval, as).get();
@@ -1181,9 +1410,18 @@ future<> user_requested_repair_task_impl::run() {
             throw std::runtime_error("aborted by user request");
         }
 
+        std::unordered_set<locator::host_id> ignore_host_ids;
+        for (const auto& node : ignore_nodes) {
+            ignore_host_ids.insert(node->host_id());
+        }
         for (auto shard : boost::irange(unsigned(0), smp::count)) {
             auto f = rs.container().invoke_on(shard, [keyspace, table_ids, id, ranges, hints_batchlog_flushed,
-                    data_centers, hosts, ignore_nodes, parent_data = get_repair_uniq_id().task_info, germs] (repair_service& local_repair) mutable -> future<> {
+                    data_centers, hosts, &ignore_host_ids, parent_data = get_repair_uniq_id().task_info, germs] (repair_service& local_repair) mutable -> future<> {
+                locator::node_set ignore_nodes;
+                const auto& topo = local_repair.get_db().local().get_token_metadata().get_topology();
+                for (const auto& host_id : ignore_host_ids) {
+                    ignore_nodes.emplace(topo.find_node(host_id, locator::topology::must_exist::yes));
+                }
                 local_repair.get_metrics().repair_total_ranges_sum += ranges.size();
                 auto task = co_await local_repair._repair_module->make_and_start_task<shard_repair_task_impl>(parent_data, tasks::task_id::create_random_id(), keyspace,
                         local_repair, germs->get().shared_from_this(), std::move(ranges), std::move(table_ids),
@@ -1289,7 +1527,7 @@ future<> data_sync_repair_task_impl::run() {
             auto f = rs.container().invoke_on(shard, [keyspace, table_ids, id, ranges, neighbors, reason, germs, parent_data = get_repair_uniq_id().task_info] (repair_service& local_repair) mutable -> future<> {
                 auto data_centers = std::vector<sstring>();
                 auto hosts = std::vector<sstring>();
-                auto ignore_nodes = std::unordered_set<gms::inet_address>();
+                locator::node_set ignore_nodes;
                 bool hints_batchlog_flushed = false;
                 auto task_impl_ptr = std::make_unique<shard_repair_task_impl>(local_repair._repair_module, tasks::task_id::create_random_id(), keyspace,
                         local_repair, germs->get().shared_from_this(), std::move(ranges), std::move(table_ids),
@@ -1370,7 +1608,7 @@ future<> repair_service::bootstrap_with_repair(locator::token_metadata_ptr tmptr
             auto range_addresses = strat.get_range_addresses(metadata_clone).get0();
 
             //Pending ranges
-            metadata_clone.update_topology(myip, _sys_ks.local().local_dc_rack());
+            metadata_clone.update_topology(myip, _sys_ks.local().local_dc_rack(), locator::node::state::joining);
             metadata_clone.update_normal_tokens(tokens, myip).get();
             auto pending_range_addresses = strat.get_range_addresses(metadata_clone).get0();
             metadata_clone.clear_gently().get();
@@ -1504,21 +1742,21 @@ future<> repair_service::bootstrap_with_repair(locator::token_metadata_ptr tmptr
     });
 }
 
-future<> repair_service::do_decommission_removenode_with_repair(locator::token_metadata_ptr tmptr, gms::inet_address leaving_node, shared_ptr<node_ops_info> ops) {
+future<> repair_service::do_decommission_removenode_with_repair(locator::token_metadata_ptr tmptr, locator::node_ptr leaving_node, shared_ptr<node_ops_info> ops) {
     assert(this_shard_id() == 0);
     using inet_address = gms::inet_address;
     return seastar::async([this, tmptr = std::move(tmptr), leaving_node = std::move(leaving_node), ops] () mutable {
         auto& db = get_db().local();
-        auto myip = utils::fb_utilities::get_broadcast_address();
         auto ks_erms = db.get_non_local_strategy_keyspaces_erms();
         auto& topology = tmptr->get_topology();
+        auto local_node = topology.local_node();
         auto local_dc = topology.get_datacenter();
-        bool is_removenode = myip != leaving_node;
+        bool is_removenode = local_node != leaving_node;
         auto op = is_removenode ? "removenode_with_repair" : "decommission_with_repair";
         streaming::stream_reason reason = is_removenode ? streaming::stream_reason::removenode : streaming::stream_reason::decommission;
         size_t nr_ranges_total = 0;
         for (const auto& [keyspace_name, erm] : ks_erms) {
-            dht::token_range_vector ranges = erm->get_ranges(leaving_node);
+            dht::token_range_vector ranges = erm->get_ranges(leaving_node->endpoint());
             auto nr_tables = get_nr_tables(db, keyspace_name);
             nr_ranges_total += ranges.size() * nr_tables;
         }
@@ -1541,7 +1779,7 @@ future<> repair_service::do_decommission_removenode_with_repair(locator::token_m
             }
             auto& strat = erm->get_replication_strategy();
             // First get all ranges the leaving node is responsible for
-            dht::token_range_vector ranges = erm->get_ranges(leaving_node);
+            dht::token_range_vector ranges = erm->get_ranges(leaving_node->endpoint());
             auto nr_tables = get_nr_tables(db, keyspace_name);
             rlogger.info("{}: started with keyspace={}, leaving_node={}, nr_ranges={}", op, keyspace_name, leaving_node, ranges.size() * nr_tables);
             size_t nr_ranges_total = ranges.size() * nr_tables;
@@ -1557,8 +1795,8 @@ future<> repair_service::do_decommission_removenode_with_repair(locator::token_m
             auto temp = tmptr->clone_after_all_left().get0();
             // leaving_node might or might not be 'leaving'. If it was not leaving (that is, removenode
             // command was used), it is still present in temp and must be removed.
-            if (temp.is_normal_token_owner(leaving_node)) {
-                temp.remove_endpoint(leaving_node);
+            if (temp.is_normal_token_owner(leaving_node->endpoint())) {
+                temp.remove_endpoint(leaving_node->endpoint());
             }
             std::unordered_map<dht::token_range, repair_neighbors> range_sources;
             dht::token_range_vector ranges_for_removenode;
@@ -1610,7 +1848,7 @@ future<> repair_service::do_decommission_removenode_with_repair(locator::token_m
                         // range.
                         // Choose the new owner node n4 to run repair to sync
                         // with all replicas.
-                        skip_this_range = *new_owner.begin() != myip;
+                        skip_this_range = *new_owner.begin() != local_node->endpoint();
                         neighbors_set.insert(current_eps.begin(), current_eps.end());
                     } else {
                         // For decommission operation, the decommission node
@@ -1630,7 +1868,7 @@ future<> repair_service::do_decommission_removenode_with_repair(locator::token_m
                         // owner node available.
                         // Choose the primary replica node n1 to run repair to
                         // sync with all replicas.
-                        skip_this_range = new_eps.front() != myip;
+                        skip_this_range = new_eps.front() != local_node->endpoint();
                         neighbors_set.insert(current_eps.begin(), current_eps.end());
                     } else {
                         // For decommission operation, the decommission node
@@ -1647,12 +1885,12 @@ future<> repair_service::do_decommission_removenode_with_repair(locator::token_m
                     throw std::runtime_error(format("{}: keyspace={}, range={}, current_replica_endpoints={}, new_replica_endpoints={}, wrong nubmer of new owner node={}",
                             op, keyspace_name, r, current_eps, new_eps, new_owner));
                 }
-                neighbors_set.erase(myip);
-                neighbors_set.erase(leaving_node);
+                neighbors_set.erase(local_node->endpoint());
+                neighbors_set.erase(leaving_node->endpoint());
                 // Remove nodes in ignore_nodes
                 if (ops) {
                     for (const auto& node : ops->ignore_nodes) {
-                        neighbors_set.erase(node);
+                        neighbors_set.erase(node->endpoint());
                     }
                 }
                 auto neighbors = boost::copy_range<std::vector<gms::inet_address>>(neighbors_set |
@@ -1699,10 +1937,11 @@ future<> repair_service::do_decommission_removenode_with_repair(locator::token_m
 
 future<> repair_service::decommission_with_repair(locator::token_metadata_ptr tmptr) {
     assert(this_shard_id() == 0);
-    return do_decommission_removenode_with_repair(std::move(tmptr), utils::fb_utilities::get_broadcast_address(), {});
+    auto leaving_node = tmptr->get_topology().local_node();
+    return do_decommission_removenode_with_repair(std::move(tmptr), std::move(leaving_node), {});
 }
 
-future<> repair_service::removenode_with_repair(locator::token_metadata_ptr tmptr, gms::inet_address leaving_node, shared_ptr<node_ops_info> ops) {
+future<> repair_service::removenode_with_repair(locator::token_metadata_ptr tmptr, locator::node_ptr leaving_node, shared_ptr<node_ops_info> ops) {
     assert(this_shard_id() == 0);
     return do_decommission_removenode_with_repair(std::move(tmptr), std::move(leaving_node), std::move(ops)).then([this] {
         rlogger.debug("Triggering off-strategy compaction for all non-system tables on removenode completion");
@@ -1715,7 +1954,7 @@ future<> repair_service::removenode_with_repair(locator::token_metadata_ptr tmpt
     });
 }
 
-future<> repair_service::do_rebuild_replace_with_repair(locator::token_metadata_ptr tmptr, sstring op, sstring source_dc, streaming::stream_reason reason, std::list<gms::inet_address> ignore_nodes) {
+future<> repair_service::do_rebuild_replace_with_repair(locator::token_metadata_ptr tmptr, sstring op, sstring source_dc, streaming::stream_reason reason, locator::node_set ignore_nodes) {
     assert(this_shard_id() == 0);
     return seastar::async([this, tmptr = std::move(tmptr), source_dc = std::move(source_dc), op = std::move(op), reason, ignore_nodes = std::move(ignore_nodes)] () mutable {
         auto& db = get_db().local();
@@ -1766,7 +2005,7 @@ future<> repair_service::do_rebuild_replace_with_repair(locator::token_metadata_
                         if (node == myip) {
                             return false;
                         }
-                        if (std::find(ignore_nodes.begin(), ignore_nodes.end(), node) != ignore_nodes.end()) {
+                        if (std::find_if(ignore_nodes.begin(), ignore_nodes.end(), [node] (const locator::node_ptr& n) { return n->endpoint() == node; }) != ignore_nodes.end()) {
                             return false;
                         }
                         return source_dc.empty() ? true : topology.get_datacenter(node) == source_dc;
@@ -1815,7 +2054,7 @@ future<> repair_service::rebuild_with_repair(locator::token_metadata_ptr tmptr, 
     });
 }
 
-future<> repair_service::replace_with_repair(locator::token_metadata_ptr tmptr, std::unordered_set<dht::token> replacing_tokens, std::list<gms::inet_address> ignore_nodes) {
+future<> repair_service::replace_with_repair(locator::token_metadata_ptr tmptr, std::unordered_set<dht::token> replacing_tokens, locator::node_set ignore_nodes) {
     assert(this_shard_id() == 0);
     auto cloned_tm = co_await tmptr->clone_async();
     auto op = sstring("replace_with_repair");
@@ -1825,7 +2064,7 @@ future<> repair_service::replace_with_repair(locator::token_metadata_ptr tmptr, 
     // update a cloned version of tmptr
     // no need to set the original version
     auto cloned_tmptr = make_token_metadata_ptr(std::move(cloned_tm));
-    cloned_tmptr->update_topology(utils::fb_utilities::get_broadcast_address(), _sys_ks.local().local_dc_rack());
+    cloned_tmptr->update_topology(utils::fb_utilities::get_broadcast_address(), _sys_ks.local().local_dc_rack(), locator::node::state::joining);
     co_await cloned_tmptr->update_normal_tokens(replacing_tokens, utils::fb_utilities::get_broadcast_address());
     co_return co_await do_rebuild_replace_with_repair(std::move(cloned_tmptr), std::move(op), std::move(source_dc), reason, std::move(ignore_nodes));
 }

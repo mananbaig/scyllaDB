@@ -65,6 +65,7 @@
 #include "db/schema_tables.hh"
 #include "service/raft/raft_group0_client.hh"
 #include "service/raft/raft_group0.hh"
+#include "utils/fb_utilities.hh"
 
 #include <sys/time.h>
 #include <sys/resource.h>
@@ -519,6 +520,7 @@ public:
             if (!cfg->host_id) {
                 cfg->host_id = locator::host_id::create_random_id();
             }
+            utils::fb_utilities::set_host_id(cfg->host_id);
             create_directories((data_dir_path + "/system").c_str());
             create_directories(cfg->commitlog_directory().c_str());
             create_directories(cfg->hints_directory().c_str());
@@ -542,6 +544,8 @@ public:
 
             sharded<locator::shared_token_metadata> token_metadata;
             locator::token_metadata::config tm_cfg;
+            tm_cfg.topo_cfg.local_host_id = cfg->host_id;
+            tm_cfg.topo_cfg.local_endpoint = utils::fb_utilities::get_broadcast_address();
             tm_cfg.topo_cfg.local_dc_rack = { snitch.local()->get_datacenter(), snitch.local()->get_rack() };
             token_metadata.start([] () noexcept { return db::schema_tables::hold_merge_lock(); }, tm_cfg).get();
             auto stop_token_metadata = defer([&token_metadata] { token_metadata.stop().get(); });
