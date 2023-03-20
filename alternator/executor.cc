@@ -783,6 +783,19 @@ future<executor::request_return_type> executor::tag_resource(client_state& clien
         co_return api_error::validation("The number of tags must be at least 1") ;
     }
     update_tags_map(*tags, tags_map,  update_tags_action::add_tags);
+
+    if (auto it = tags_map.find("system:default_time_to_live"); it != tags_map.end()) {
+        const int32_t default_ttl = std::atoi(it->second.data());
+        if (default_ttl <= 0) {
+            throw api_error::validation(
+                    format("Incorrect default_time_to_live tag value: {}. It must be a positive integer", it->second));
+        }
+        elogger.debug("Updating default_time_to_live of table {} to {}", schema->cf_name(), default_ttl);
+        schema_builder builder(schema);
+        builder.set_default_time_to_live(std::chrono::seconds(default_ttl));
+        schema = builder.build();
+    }
+
     co_await db::update_tags(_mm, schema, std::move(tags_map));
     co_return json_string("");
 }
@@ -803,6 +816,12 @@ future<executor::request_return_type> executor::untag_resource(client_state& cli
 
     std::map<sstring, sstring> tags_map = get_tags_of_table_or_throw(schema);
     update_tags_map(*tags, tags_map, update_tags_action::delete_tags);
+    if (schema->default_time_to_live() != gc_clock::duration::zero() && !tags_map.contains("system:default_time_to_live")) {
+        elogger.debug("Deleting default_time_to_live of table {}", schema->cf_name());
+        schema_builder builder(schema);
+        builder.set_default_time_to_live(gc_clock::duration::zero());
+        schema = builder.build();
+    }
     co_await db::update_tags(_mm, schema, std::move(tags_map));
     co_return json_string("");
 }
@@ -1038,6 +1057,15 @@ static future<executor::request_return_type> create_table_on_shard0(tracing::tra
     }
     builder.add_extension(db::tags_extension::NAME, ::make_shared<db::tags_extension>(tags_map));
 
+    if (auto it = tags_map.find("system:default_time_to_live"); it != tags_map.end()) {
+        const int32_t default_ttl = std::atoi(it->second.data());
+        if (default_ttl <= 0) {
+            throw api_error::validation(
+                    format("Incorrect default_time_to_live tag value: {}. It must be a positive integer", it->second));
+        }
+        builder.set_default_time_to_live(std::chrono::seconds(default_ttl));
+    }
+
     schema_ptr schema = builder.build();
     auto where_clause_it = where_clauses.begin();
     for (auto& view_builder : view_builders) {
@@ -1162,6 +1190,23 @@ future<executor::request_return_type> executor::update_table(client_state& clien
     });
 }
 
+static atomic_cell make_live_cell(const abstract_type& type, api::timestamp_type ts, const bytes& value,
+        gc_clock::duration default_ttl, atomic_cell::collection_member is_collection_member = atomic_cell::collection_member::no) {
+    if (default_ttl == gc_clock::duration::zero()) {
+        return atomic_cell::make_live(type, ts, value, is_collection_member);
+    } else {
+        return atomic_cell::make_live(type, ts, value, gc_clock::now() + default_ttl, default_ttl, is_collection_member);
+    }
+}
+
+static row_marker make_row_marker(api::timestamp_type ts, gc_clock::duration default_ttl) {
+    if (default_ttl == gc_clock::duration::zero()) {
+        return row_marker(ts);
+    } else {
+        return row_marker(ts, default_ttl, gc_clock::now() + default_ttl);
+    }
+}
+
 // attribute_collector is a helper class used to accept several attribute
 // puts or deletes, and collect them as single collection mutation.
 // The implementation is somewhat complicated by the need of cells in a
@@ -1176,12 +1221,13 @@ class attribute_collector {
     }
 public:
     attribute_collector() : collected(attrs_type()->get_keys_type()->as_less_comparator()) { }
-    void put(bytes&& name, const bytes& val, api::timestamp_type ts) {
-        add(std::move(name), atomic_cell::make_live(*bytes_type, ts, val, atomic_cell::collection_member::yes));
+
+    void put(bytes&& name, const bytes& val, api::timestamp_type ts, gc_clock::duration default_ttl) {
+        add(std::move(name), make_live_cell(*bytes_type, ts, val, default_ttl, atomic_cell::collection_member::yes));
 
     }
-    void put(const bytes& name, const bytes& val, api::timestamp_type ts) {
-        add(name, atomic_cell::make_live(*bytes_type, ts, val, atomic_cell::collection_member::yes));
+    void put(const bytes& name, const bytes& val, api::timestamp_type ts, gc_clock::duration default_ttl) {
+        add(name, make_live_cell(*bytes_type, ts, val, default_ttl, atomic_cell::collection_member::yes));
     }
     void del(bytes&& name, api::timestamp_type ts) {
         add(std::move(name), atomic_cell::make_dead(ts, gc_clock::now()));
@@ -1333,13 +1379,14 @@ mutation put_or_delete_item::build(schema_ptr schema, api::timestamp_type ts) co
     }
     // else, a PutItem operation:
     auto& row = m.partition().clustered_row(*schema, _ck);
+    gc_clock::duration default_ttl = schema->default_time_to_live();
     attribute_collector attrs_collector;
     for (auto& c : *_cells) {
         const column_definition* cdef = find_attribute(*schema, c.column_name);
         if (!cdef) {
-            attrs_collector.put(c.column_name, c.value, ts);
+            attrs_collector.put(c.column_name, c.value, ts, default_ttl);
         } else {
-            row.cells().apply(*cdef, atomic_cell::make_live(*cdef->type, ts, std::move(c.value)));
+            row.cells().apply(*cdef, make_live_cell(*cdef->type, ts, c.value, default_ttl));
         }
     }
     if (!attrs_collector.empty()) {
@@ -1347,7 +1394,7 @@ mutation put_or_delete_item::build(schema_ptr schema, api::timestamp_type ts) co
         row.cells().apply(attrs_column(*schema), std::move(serialized_map));
     }
     // To allow creation of an item with no attributes, we need a row marker.
-    row.apply(row_marker(ts));
+    row.apply(make_row_marker(ts, default_ttl));
     // PutItem is supposed to completely replace the old item, so we need to
     // also have a tombstone removing old cells. We can't use the timestamp
     // ts, because when data and tombstone tie on timestamp, the tombstone
@@ -2749,6 +2796,7 @@ update_item_operation::apply(std::unique_ptr<rjson::value> previous_item, api::t
 
     mutation m(_schema, _pk);
     auto& row = m.partition().clustered_row(*_schema, _ck);
+    gc_clock::duration default_ttl = _schema->default_time_to_live();
     attribute_collector attrs_collector;
     bool any_updates = false;
     auto do_update = [&] (bytes&& column_name, const rjson::value& json_value,
@@ -2793,9 +2841,9 @@ update_item_operation::apply(std::unique_ptr<rjson::value> previous_item, api::t
         const column_definition* cdef = find_attribute(*_schema, column_name);
         if (cdef) {
             bytes column_value = get_key_from_typed_value(json_value, *cdef);
-            row.cells().apply(*cdef, atomic_cell::make_live(*cdef->type, ts, column_value));
+            row.cells().apply(*cdef, make_live_cell(*cdef->type, ts, column_value, default_ttl));
         } else {
-            attrs_collector.put(std::move(column_name), serialize_item(json_value), ts);
+            attrs_collector.put(std::move(column_name), serialize_item(json_value), ts, default_ttl);
         }
     };
     bool any_deletes = false;
@@ -2990,7 +3038,7 @@ update_item_operation::apply(std::unique_ptr<rjson::value> previous_item, api::t
     // marker. An update with only DELETE operations must not add a row marker
     // (this was issue #5862) but any other update, even an empty one, should.
     if (any_updates || !any_deletes) {
-        row.apply(row_marker(ts));
+        row.apply(make_row_marker(ts, default_ttl));
     } else if (_returnvalues == returnvalues::ALL_NEW && !previous_item) {
         // There was no pre-existing item, and we're not creating one, so
         // don't report the new item in the returned Attributes.
