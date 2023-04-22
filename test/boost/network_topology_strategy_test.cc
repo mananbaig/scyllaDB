@@ -33,6 +33,7 @@
 #include "test/lib/random_utils.hh"
 #include <seastar/core/coroutine.hh>
 #include "db/schema_tables.hh"
+#include "message/msg_addr.hh"
 
 using namespace locator;
 
@@ -189,6 +190,7 @@ locator::endpoint_dc_rack make_endpoint_dc_rack(gms::inet_address endpoint) {
 void simple_test() {
     utils::fb_utilities::set_broadcast_address(gms::inet_address("localhost"));
     utils::fb_utilities::set_broadcast_rpc_address(gms::inet_address("localhost"));
+    utils::fb_utilities::set_host_id(locator::host_id::create_random_id());
 
     // Create the RackInferringSnitch
     snitch_config cfg;
@@ -199,7 +201,7 @@ void simple_test() {
     snitch.invoke_on_all(&snitch_ptr::start).get();
 
     locator::token_metadata::config tm_cfg;
-    tm_cfg.topo_cfg.this_host_id = host_id::create_random_id();
+    tm_cfg.topo_cfg.this_host_id = utils::fb_utilities::get_host_id();
     tm_cfg.topo_cfg.this_endpoint = utils::fb_utilities::get_broadcast_address();
     tm_cfg.topo_cfg.local_dc_rack = { snitch.local()->get_datacenter(), snitch.local()->get_rack() };
     locator::shared_token_metadata stm([] () noexcept { return db::schema_tables::hold_merge_lock(); }, tm_cfg);
@@ -272,6 +274,7 @@ void simple_test() {
 void heavy_origin_test() {
     utils::fb_utilities::set_broadcast_address(gms::inet_address("localhost"));
     utils::fb_utilities::set_broadcast_rpc_address(gms::inet_address("localhost"));
+    utils::fb_utilities::set_host_id(locator::host_id::create_random_id());
 
     // Create the RackInferringSnitch
     snitch_config cfg;
@@ -559,13 +562,15 @@ void generate_topology(topology& topo, const std::unordered_map<sstring, size_t>
         const sstring& dc = dcs[udist(0, dcs.size() - 1)(e1)];
         auto rc = racks_per_dc.at(dc);
         auto r = udist(0, rc)(e1);
-        topo.add_node(host_id::create_random_id(), node, {dc, to_sstring(r)}, locator::node::state::normal);
+        auto host_id = node == gms::inet_address("localhost") ? utils::fb_utilities::get_host_id() : host_id::create_random_id();
+        topo.add_node(host_id, node, {dc, to_sstring(r)}, locator::node::state::normal);
     }
 }
 
 SEASTAR_THREAD_TEST_CASE(testCalculateEndpoints) {
     utils::fb_utilities::set_broadcast_address(gms::inet_address("localhost"));
     utils::fb_utilities::set_broadcast_rpc_address(gms::inet_address("localhost"));
+    utils::fb_utilities::set_host_id(locator::host_id::create_random_id());
 
     constexpr size_t NODES = 100;
     constexpr size_t VNODES = 64;
@@ -715,4 +720,52 @@ SEASTAR_THREAD_TEST_CASE(test_topology_compare_endpoints) {
         topo.test_compare_endpoints(address, bogus_address, a2);
         return make_ready_future<>();
     }).get();
+}
+
+// although not strictly related to network_topology_strategy
+// the use of msg_addr is related to topology changes
+SEASTAR_THREAD_TEST_CASE(test_msg_addr) {
+    auto ip1 = gms::inet_address("127.0.0.1");
+    auto host_id1 = locator::host_id::create_random_id();
+    auto ip2 = gms::inet_address("127.0.0.2");
+    auto host_id2 = locator::host_id::create_random_id();
+
+    auto a1 = netw::msg_addr(ip1);
+    auto a1_with_id1 = netw::msg_addr(ip1, host_id1);
+    BOOST_REQUIRE_LT(a1, a1_with_id1);
+    BOOST_REQUIRE_LE(a1, a1_with_id1);
+    BOOST_REQUIRE_NE(a1, a1_with_id1);
+    BOOST_REQUIRE_GE(a1_with_id1, a1);
+    BOOST_REQUIRE_GT(a1_with_id1, a1);
+    BOOST_REQUIRE((a1 <=> a1_with_id1) < 0);
+    BOOST_REQUIRE((a1_with_id1 <=> a1) > 0);
+
+    auto a1_with_id2 = netw::msg_addr(ip1, host_id2);
+    BOOST_REQUIRE_NE(a1_with_id1, a1_with_id2);
+    BOOST_REQUIRE((a1_with_id1 <=> a1_with_id2) != 0);
+    BOOST_REQUIRE((a1_with_id1 <=> a1_with_id2) == (host_id1 <=> host_id2));
+
+    auto a2 = netw::msg_addr(ip2);
+    BOOST_REQUIRE_NE(a1, a2);
+    BOOST_REQUIRE((a1 <=> a2) != 0);
+    auto a2_with_id2 = netw::msg_addr(ip2, host_id2);
+    BOOST_REQUIRE_NE(a2, a2_with_id2);
+    BOOST_REQUIRE((a2 <=> a2_with_id2) != 0);
+    BOOST_REQUIRE_NE(a1, a2_with_id2);
+    BOOST_REQUIRE_NE(a1_with_id1, a2_with_id2);
+    BOOST_REQUIRE((a1_with_id1 <=> a2_with_id2) != 0);
+    BOOST_REQUIRE((a1 <=> a2) == (a1_with_id1 <=> a2_with_id2));
+
+    std::vector<netw::msg_addr> addrs_vector = {
+        a1, a1_with_id1, a1_with_id2,
+        a2, a2_with_id2,
+    };
+    std::unordered_set<netw::msg_addr> addrs_set(addrs_vector.cbegin(), addrs_vector.cend());
+
+    BOOST_REQUIRE_EQUAL(addrs_vector.size(), addrs_set.size());
+    for (const auto& x : addrs_vector) {
+        BOOST_REQUIRE(addrs_set.contains(x));
+        BOOST_REQUIRE(addrs_set.erase(x));
+    }
+    BOOST_REQUIRE(addrs_set.empty());
 }
