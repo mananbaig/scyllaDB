@@ -14,6 +14,7 @@
 #include <seastar/core/metrics.hh>
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/util/defer.hh>
+#include <seastar/util/later.hh>
 #include "replica/memtable.hh"
 #include <chrono>
 #include <boost/version.hpp>
@@ -1135,8 +1136,8 @@ future<> row_cache::invalidate(external_updater& eu, const dht::partition_range&
 
 future<> row_cache::invalidate(external_updater& eu, dht::partition_range_vector&& ranges) noexcept {
   try {
-    return do_update(eu, [this, ranges = std::move(ranges)] {
-        return seastar::async([this, ranges = std::move(ranges)] {
+    return do_update(eu, [this, ranges = std::move(ranges)] () -> future<> {
+        // FIXME: indentation
             auto on_failure = defer([this] () noexcept {
                 this->clear_now();
                 _prev_snapshot_pos = {};
@@ -1145,7 +1146,7 @@ future<> row_cache::invalidate(external_updater& eu, dht::partition_range_vector
 
             for (auto&& range : ranges) {
                 _prev_snapshot_pos = dht::ring_position_view::for_range_start(range);
-                seastar::thread::maybe_yield();
+                co_await coroutine::maybe_yield();
 
                 while (true) {
                     auto done = _update_section(_tracker.region(), [&] {
@@ -1178,12 +1179,11 @@ future<> row_cache::invalidate(external_updater& eu, dht::partition_range_vector
                     }
                     // _prev_snapshot_pos must be updated at this point such that every position < _prev_snapshot_pos
                     // is already invalidated and >= _prev_snapshot_pos is not yet invalidated.
-                    seastar::thread::yield();
+                    co_await yield();
                 }
             }
 
             on_failure.cancel();
-        });
     });
   } catch (...) {
     return invalidate_on_error(eu, std::current_exception());
