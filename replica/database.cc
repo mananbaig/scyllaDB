@@ -1413,7 +1413,7 @@ database::drop_caches() const {
     std::unordered_map<table_id, lw_shared_ptr<column_family>> tables = get_column_families();
     for (auto&& e : tables) {
         table& t = *e.second;
-        co_await t.get_row_cache().invalidate(row_cache::external_updater([] {}));
+        co_await t.get_row_cache().invalidate();
 
         auto sstables = t.get_sstables();
         for (sstables::shared_sstable sst : *sstables) {

@@ -930,8 +930,8 @@ row_cache::phase_type row_cache::phase_of(dht::ring_position_view pos) {
 }
 
 template <typename Updater>
-future<> row_cache::do_update(external_updater eu, replica::memtable& m, Updater updater) {
-  return do_update(std::move(eu), [this, &m, updater = std::move(updater)] {
+future<> row_cache::do_update(external_updater& eu, replica::memtable& m, Updater updater) {
+  return do_update(eu, [this, &m, updater = std::move(updater)] {
     real_dirty_memory_accounter real_dirty_acc(m, _tracker);
     m.on_detach_from_region_group();
     _tracker.region().merge(m); // Now all data in memtable belongs to cache
@@ -1014,8 +1014,8 @@ future<> row_cache::do_update(external_updater eu, replica::memtable& m, Updater
   });
 }
 
-future<> row_cache::update(external_updater eu, replica::memtable& m) {
-    return do_update(std::move(eu), m, [this] (logalloc::allocating_section& alloc,
+future<> row_cache::update(external_updater& eu, replica::memtable& m) {
+    return do_update(eu, m, [this] (logalloc::allocating_section& alloc,
             row_cache::partitions_type::iterator cache_i, replica::memtable_entry& mem_e, partition_presence_checker& is_present,
             real_dirty_memory_accounter& acc, const partitions_type::bound_hint& hint) mutable {
         // If cache doesn't contain the entry we cannot insert it because the mutation may be incomplete.
@@ -1047,8 +1047,8 @@ future<> row_cache::update(external_updater eu, replica::memtable& m) {
     });
 }
 
-future<> row_cache::update_invalidating(external_updater eu, replica::memtable& m) {
-    return do_update(std::move(eu), m, [this] (logalloc::allocating_section& alloc,
+future<> row_cache::update_invalidating(external_updater& eu, replica::memtable& m) {
+    return do_update(eu, m, [this] (logalloc::allocating_section& alloc,
         row_cache::partitions_type::iterator cache_i, replica::memtable_entry& mem_e, partition_presence_checker& is_present,
         real_dirty_memory_accounter& acc, const partitions_type::bound_hint&)
     {
@@ -1113,16 +1113,18 @@ void row_cache::invalidate_locked(const dht::decorated_key& dk) {
     }
 }
 
-future<> row_cache::invalidate(external_updater eu, const dht::decorated_key& dk) {
-    return invalidate(std::move(eu), dht::partition_range::make_singular(dk));
+row_cache::external_updater row_cache::noop_external_updater([]{});
+
+future<> row_cache::invalidate(external_updater& eu, const dht::decorated_key& dk) {
+    return invalidate(eu, dht::partition_range::make_singular(dk));
 }
 
-future<> row_cache::invalidate(external_updater eu, const dht::partition_range& range) {
-    return invalidate(std::move(eu), dht::partition_range_vector({range}));
+future<> row_cache::invalidate(external_updater& eu, const dht::partition_range& range) {
+    return invalidate(eu, dht::partition_range_vector({range}));
 }
 
-future<> row_cache::invalidate(external_updater eu, dht::partition_range_vector&& ranges) {
-    return do_update(std::move(eu), [this, ranges = std::move(ranges)] {
+future<> row_cache::invalidate(external_updater& eu, dht::partition_range_vector&& ranges) {
+    return do_update(eu, [this, ranges = std::move(ranges)] {
         return seastar::async([this, ranges = std::move(ranges)] {
             auto on_failure = defer([this] () noexcept {
                 this->clear_now();
@@ -1339,9 +1341,9 @@ std::ostream& operator<<(std::ostream& out, row_cache& rc) {
     return out;
 }
 
-future<> row_cache::do_update(row_cache::external_updater eu, row_cache::internal_updater iu) noexcept {
+future<> row_cache::do_update(row_cache::external_updater& eu, row_cache::internal_updater iu) noexcept {
   // FIXME: indentation
-  return do_with(std::move(eu), std::move(iu), [this] (auto& eu, auto& iu) {
+  return do_with(std::move(iu), [this, &eu] (auto& iu) {
     return futurize_invoke([this] {
         return get_units(_update_sem, 1);
     }).then([this, &eu, &iu] (auto permit) mutable {
