@@ -405,6 +405,9 @@ public:
     // has just been flushed to the underlying data source.
     // The memtable can be queried during the process, but must not be written.
     // After the update is complete, memtable is empty.
+    // external_updater::execute is called at most once and it must
+    // provide strong failure guarantees as it might be called again in the
+    // error handling path.
     future<> update(external_updater&, replica::memtable&);
 
     // Like update(), synchronizes cache with an incremental change to the underlying

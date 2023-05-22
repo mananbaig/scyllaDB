@@ -11,6 +11,7 @@
 #include <seastar/core/do_with.hh>
 #include <seastar/core/future-util.hh>
 #include <seastar/core/metrics.hh>
+#include <seastar/coroutine/as_future.hh>
 #include <seastar/util/defer.hh>
 #include "replica/memtable.hh"
 #include <chrono>
@@ -1343,30 +1344,30 @@ std::ostream& operator<<(std::ostream& out, row_cache& rc) {
 
 future<> row_cache::do_update(row_cache::external_updater& eu, row_cache::internal_updater iu) noexcept {
   // FIXME: indentation
-  return do_with(std::move(iu), [this, &eu] (auto& iu) {
-    return futurize_invoke([this] {
-        return get_units(_update_sem, 1);
-    }).then([this, &eu, &iu] (auto permit) mutable {
-      return eu.prepare().then([this, &eu, &iu, permit = std::move(permit)] () mutable {
+    auto permit = co_await get_units(_update_sem, 1);
+    co_await eu.prepare();
         auto pos = dht::ring_position::min();
         eu.execute();
+    // No failures are allowed past this point
+    // as external_updater::execute must be called exactly once on success
+    // or none if failed before getting here.
         [&] () noexcept {
             _prev_snapshot_pos = std::move(pos);
             _prev_snapshot = std::exchange(_underlying, _snapshot_source());
             ++_underlying_phase;
         }();
-        return futurize_invoke([&iu] {
-            return iu();
-        }).then_wrapped([this, permit = std::move(permit)] (auto f) {
+    // All errors from the internal_updater are ignored.
+    // internal_updater must have strong failure guarantees
+    // Upon failure, it should still leave the cache
+    // in a state consistent with the update it is performing.
+    auto f = co_await coroutine::as_future(futurize_invoke([&iu] {
+        return iu();
+    }));
             _prev_snapshot_pos = {};
             _prev_snapshot = {};
             if (f.failed()) {
                 clogger.warn("Failure during cache update: {}", f.get_exception());
             }
-        });
-      });
-    });
-  });
 }
 
 std::ostream& operator<<(std::ostream& out, const cache_entry& e) {
