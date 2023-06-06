@@ -2123,7 +2123,7 @@ SEASTAR_TEST_CASE(sstable_scrub_validate_mode_test) {
             auto scrubbed_mt = make_lw_shared<replica::memtable>(schema);
             auto sst = env.make_sstable(schema);
 
-            testlog.info("Writing sstable {}", sst->get_filename());
+            testlog.info("Writing sstable {:D}", *sst);
 
             const auto corrupt_fragments = write_corrupt_sstable(env, *sst, permit, [&, mut_builder = mutation_rebuilder_v2(schema)] (mutation_fragment_v2&& mf, bool) mutable {
                 if (mf.is_end_of_partition()) {
@@ -2135,7 +2135,7 @@ SEASTAR_TEST_CASE(sstable_scrub_validate_mode_test) {
 
             sst->load().get();
 
-            testlog.info("Loaded sstable {}", sst->get_filename());
+            testlog.info("Loaded sstable {:D}", *sst);
 
             auto table = env.make_table_for_tests(schema);
             auto close_cf = deferred_stop(table);
@@ -2325,11 +2325,11 @@ SEASTAR_TEST_CASE(sstable_scrub_skip_mode_test) {
                 }
             });
 
-            testlog.info("Writing sstable {}", sst->get_filename());
+            testlog.info("Writing sstable {:D}", *sst);
 
             sst->load().get();
 
-            testlog.info("Loaded sstable {}", sst->get_filename());
+            testlog.info("Loaded sstable {:D}", *sst);
 
             auto table = env.make_table_for_tests(schema);
             auto close_cf = deferred_stop(table);
@@ -2408,7 +2408,7 @@ SEASTAR_TEST_CASE(sstable_scrub_segregate_mode_test) {
             auto scrubbed_mt = make_lw_shared<replica::memtable>(schema);
             auto sst = env.make_sstable(schema);
 
-            testlog.info("Writing sstable {}", sst->get_filename());
+            testlog.info("Writing sstable {:D}", *sst);
 
             const auto corrupt_fragments = write_corrupt_sstable(env, *sst, permit, [&, mut_builder = mutation_rebuilder_v2(schema)] (mutation_fragment_v2&& mf, bool) mutable {
                 if (mf.is_end_of_partition()) {
@@ -2420,7 +2420,7 @@ SEASTAR_TEST_CASE(sstable_scrub_segregate_mode_test) {
 
             sst->load().get();
 
-            testlog.info("Loaded sstable {}", sst->get_filename());
+            testlog.info("Loaded sstable {:D}", *sst);
 
             auto table = env.make_table_for_tests(schema);
             auto close_cf = deferred_stop(table);
@@ -2514,7 +2514,7 @@ SEASTAR_TEST_CASE(sstable_scrub_quarantine_mode_test) {
                 auto scrubbed_mt = make_lw_shared<replica::memtable>(schema);
                 auto sst = env.make_sstable(schema);
 
-                testlog.info("Writing sstable {}", sst->get_filename());
+                testlog.info("Writing sstable {:D}", *sst);
 
                 const auto corrupt_fragments = write_corrupt_sstable(env, *sst, permit, [&, mut_builder = mutation_rebuilder_v2(schema)] (mutation_fragment_v2&& mf, bool) mutable {
                     if (mf.is_end_of_partition()) {
@@ -2526,7 +2526,7 @@ SEASTAR_TEST_CASE(sstable_scrub_quarantine_mode_test) {
 
                 sst->load().get();
 
-                testlog.info("Loaded sstable {}", sst->get_filename());
+                testlog.info("Loaded sstable {:D}", *sst);
 
                 auto table = env.make_table_for_tests(schema);
                 auto close_cf = deferred_stop(table);
@@ -4890,31 +4890,6 @@ SEASTAR_TEST_CASE(compaction_manager_stop_and_drain_race_test) {
 
     testlog.info("stopping compaction manager");
     co_await cm.stop();
-}
-
-SEASTAR_TEST_CASE(test_print_shared_sstables_vector) {
-    return test_env::do_with_async([] (test_env& env) {
-        simple_schema ss;
-        auto s = ss.schema();
-        auto pks = ss.make_pkeys(2);
-        auto sst_gen = env.make_sst_factory(s);
-
-        std::vector<sstables::shared_sstable> ssts(2);
-
-        auto mut0 = mutation(s, pks[0]);
-        mut0.partition().apply_insert(*s, ss.make_ckey(0), ss.new_timestamp());
-        ssts[0] = make_sstable_containing(sst_gen, {std::move(mut0)});
-
-        auto mut1 = mutation(s, pks[1]);
-        mut1.partition().apply_insert(*s, ss.make_ckey(1), ss.new_timestamp());
-        ssts[1] = make_sstable_containing(sst_gen, {std::move(mut1)});
-
-        std::string msg = format("{}", ssts);
-        for (const auto& sst : ssts) {
-            auto gen_str = format("{}", sst->generation());
-            BOOST_REQUIRE(msg.find(gen_str) != std::string::npos);
-        }
-    });
 }
 
 SEASTAR_TEST_CASE(tombstone_gc_disabled_test) {

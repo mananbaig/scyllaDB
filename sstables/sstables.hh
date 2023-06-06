@@ -346,6 +346,10 @@ public:
         return _version;
     }
 
+    format_types get_format() const noexcept {
+        return _format;
+    }
+
     // Returns the total bytes of all components.
     uint64_t bytes_on_disk() const;
 
@@ -364,18 +368,6 @@ public:
 
     sstring component_basename(component_type f) const {
         return component_basename(_schema->ks_name(), _schema->cf_name(), _version, _generation, _format, f);
-    }
-
-    sstring get_filename() const {
-        return filename(component_type::Data);
-    }
-
-    sstring toc_filename() const {
-        return filename(component_type::TOC);
-    }
-
-    sstring index_filename() const {
-        return filename(component_type::Index);
     }
 
     bool requires_view_building() const;
@@ -465,10 +457,7 @@ public:
 
 private:
     sstring filename(component_type f) const {
-        return filename(_storage->prefix(), f);
-    }
-
-    sstring filename(const sstring& dir, component_type f) const {
+        auto dir = _storage->prefix();
         return filename(dir, _schema->ks_name(), _schema->cf_name(), _version, _generation, _format, f);
     }
 
@@ -960,3 +949,36 @@ future<> remove_table_directory_if_has_no_snapshots(fs::path table_dir);
 future<> remove_by_toc_name(sstring sstable_toc_name);
 
 } // namespace sstables
+
+template <>
+struct fmt::formatter<sstables::sstable> {
+    std::optional<sstables::component_type> f = std::nullopt;
+
+    constexpr auto parse(format_parse_context& ctx) {
+        auto it = ctx.begin(), end = ctx.end();
+        if (it != end) {
+            switch (*it++) {
+            case 'T':
+                f = sstables::component_type::TOC;
+                break;
+            case 'I':
+                f = sstables::component_type::Index;
+                break;
+            case 'D':
+                f = sstables::component_type::Data;
+                break;
+            default:
+                throw format_error("unknown format specifier");
+            }
+        }
+        if (it != end && *it != '}') {
+            throw format_error("invalid format");
+        }
+        return it;
+    }
+
+    template <typename Ctx>
+    auto format(const sstables::sstable& sst, Ctx& ctx) const {
+        return format_to(ctx.out(), "{}", sst.get_storage().location(sst, f));
+    }
+};

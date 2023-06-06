@@ -371,7 +371,8 @@ future<sstables::compaction_result> compaction_task_executor::compact_sstables(s
             }
         }
         if (!sstables_requiring_cleanup.empty()) {
-            cmlog.info("The following SSTables require cleaned up in this compaction: {}", sstables_requiring_cleanup);
+            cmlog.info("The following SSTables require cleaned up in this compaction: {}",
+                    sstables_requiring_cleanup | boost::adaptors::transformed(sstables::cm_format<sstables::with_origin::yes>));
             if (!cs.owned_ranges_ptr) {
                 on_internal_error_noexcept(cmlog, "SSTables require cleanup but compaction state has null owned ranges");
             }
@@ -676,7 +677,7 @@ sstables::shared_sstable sstables_task_executor::consume_sstable() {
     auto sst = _sstables.back();
     _sstables.pop_back();
     --_cm._stats.pending_tasks; // from this point on, switch_state(pending|active) works the same way as any other task
-    cmlog.debug("{}", format("consumed {}", sst->get_filename()));
+    cmlog.debug("{}", format("consumed {:D}", *sst));
     return sst;
 }
 
@@ -1457,7 +1458,7 @@ private:
             // expected, just continue with the other sstables when seeing
             // one.
             _cm._stats.errors++;
-            cmlog.error("Scrubbing in validate mode {} failed due to {}, continuing.", sst->get_filename(), std::current_exception());
+            cmlog.error("Scrubbing in validate mode {:D} failed due to {}, continuing.", *sst, std::current_exception());
         }
 
         co_return sstables::compaction_result{};

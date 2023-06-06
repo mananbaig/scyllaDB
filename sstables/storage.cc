@@ -71,6 +71,9 @@ public:
     }
 
     virtual sstring prefix() const override { return dir; }
+    virtual sstring location(const sstable& sst, std::optional<component_type> f = std::nullopt) const override {
+        return sst.filename(f.value_or(component_type::Data));
+    }
 };
 
 future<data_sink> filesystem_storage::make_data_or_index_sink(sstable& sst, component_type type, io_priority_class pc) {
@@ -101,7 +104,7 @@ future<file> filesystem_storage::open_component(const sstable& sst, component_ty
     auto create_flags = open_flags::create | open_flags::exclusive;
     auto readonly = (flags & create_flags) != create_flags;
     auto tgt_dir = !readonly && temp_dir ? *temp_dir : dir;
-    auto name = sst.filename(tgt_dir, type);
+    auto name = tgt_dir + "/" + sst.component_basename(type);
 
     auto f = open_sstable_component_file_non_checked(name, flags, options, check_integrity);
 
@@ -290,7 +293,7 @@ future<> filesystem_storage::check_create_links_replay(const sstable& sst, const
 /// \param generation - the generation of the destination sstable
 /// \param mark_for_removal - mark the sstable for removal after linking it to the destination dst_dir
 future<> filesystem_storage::create_links_common(const sstable& sst, sstring dst_dir, generation_type generation, mark_for_removal mark_for_removal) const {
-    sstlog.trace("create_links: {} -> {} generation={} mark_for_removal={}", sst.get_filename(), dst_dir, generation, mark_for_removal);
+    sstlog.trace("create_links: {:D} -> {} generation={} mark_for_removal={}", sst, dst_dir, generation, mark_for_removal);
     auto comps = sst.all_components();
     co_await check_create_links_replay(sst, dst_dir, generation, comps);
     // TemporaryTOC is always first, TOC is always last
@@ -316,7 +319,7 @@ future<> filesystem_storage::create_links_common(const sstable& sst, sstring dst
         co_await sst.sstable_write_io_check(remove_file, std::move(dst_temp_toc));
     }
     co_await sst.sstable_write_io_check(sync_directory, dst_dir);
-    sstlog.trace("create_links: {} -> {} generation={}: done", sst.get_filename(), dst_dir, generation);
+    sstlog.trace("create_links: {:D} -> {} generation={}: done", sst, dst_dir, generation);
 }
 
 future<> filesystem_storage::create_links(const sstable& sst, const sstring& dir) const {
@@ -334,8 +337,8 @@ future<> filesystem_storage::snapshot(const sstable& sst, sstring dir, absolute_
 future<> filesystem_storage::move(const sstable& sst, sstring new_dir, generation_type new_generation, delayed_commit_changes* delay_commit) {
     co_await touch_directory(new_dir);
     sstring old_dir = dir;
-    sstlog.debug("Moving {} old_generation={} to {} new_generation={} do_sync_dirs={}",
-            sst.get_filename(), sst._generation, new_dir, new_generation, delay_commit == nullptr);
+    sstlog.debug("Moving {:D} old_generation={} to {} new_generation={} do_sync_dirs={}",
+            sst, sst._generation, new_dir, new_generation, delay_commit == nullptr);
     co_await create_links_common(sst, new_dir, new_generation, mark_for_removal::yes);
     dir = new_dir;
     generation_type old_generation = sst._generation;
@@ -377,17 +380,17 @@ future<> filesystem_storage::change_state(const sstable& sst, sstring to, genera
         co_return; // Already there
     }
 
-    sstlog.info("Moving sstable {} to {}", sst.get_filename(), path);
+    sstlog.info("Moving sstable {:D} to {}", sst, path);
     co_await move(sst, path.native(), std::move(new_generation), delay_commit);
 }
 
 future<> filesystem_storage::wipe(const sstable& sst) noexcept {
-    // We must be able to generate toc_filename()
+    // We must be able to generate TOC file name
     // in order to delete the sstable.
     // Running out of memory here will terminate.
     auto name = [&sst] () noexcept {
         memory::scoped_critical_alloc_section _;
-        return sst.toc_filename();
+        return sst.filename(component_type::TOC);
     }();
 
     try {
@@ -452,6 +455,16 @@ public:
     }
 
     virtual sstring prefix() const override { return _location; }
+    virtual sstring location(const sstable& sst, std::optional<component_type> f = std::nullopt) const override {
+        sstring ret = format("s3://{}/{}", _bucket, _remote_prefix.value_or(_location));
+        if (f) {
+            ret += sstable_version_constants::get_component_map(sst.get_version()).at(*f);
+        }
+        if (!_remote_prefix) {
+            ret += " (orphan)";
+        }
+        return ret;
+    }
 };
 
 sstring s3_storage::make_s3_object_name(const sstable& sst, component_type type) {
