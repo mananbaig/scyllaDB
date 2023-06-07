@@ -7,11 +7,14 @@
  */
 
 #include "row_cache.hh"
+#include <exception>
 #include <seastar/core/memory.hh>
 #include <seastar/core/do_with.hh>
 #include <seastar/core/future-util.hh>
 #include <seastar/core/metrics.hh>
+#include <seastar/coroutine/as_future.hh>
 #include <seastar/util/defer.hh>
+#include <seastar/util/later.hh>
 #include "replica/memtable.hh"
 #include <chrono>
 #include <boost/version.hpp>
@@ -24,6 +27,7 @@
 #include "readers/nonforwardable.hh"
 #include "cache_flat_mutation_reader.hh"
 #include "clustering_key_filter.hh"
+#include "utils/error_injection.hh"
 
 namespace cache {
 
@@ -929,8 +933,8 @@ row_cache::phase_type row_cache::phase_of(dht::ring_position_view pos) {
 }
 
 template <typename Updater>
-future<> row_cache::do_update(external_updater eu, replica::memtable& m, Updater updater) {
-  return do_update(std::move(eu), [this, &m, updater = std::move(updater)] {
+future<> row_cache::do_update(external_updater& eu, replica::memtable& m, Updater updater) {
+  return do_update(eu, [this, &m, updater = std::move(updater)] {
     real_dirty_memory_accounter real_dirty_acc(m, _tracker);
     m.on_detach_from_region_group();
     _tracker.region().merge(m); // Now all data in memtable belongs to cache
@@ -1013,8 +1017,8 @@ future<> row_cache::do_update(external_updater eu, replica::memtable& m, Updater
   });
 }
 
-future<> row_cache::update(external_updater eu, replica::memtable& m) {
-    return do_update(std::move(eu), m, [this] (logalloc::allocating_section& alloc,
+future<> row_cache::update(external_updater& eu, replica::memtable& m) {
+    return do_update(eu, m, [this] (logalloc::allocating_section& alloc,
             row_cache::partitions_type::iterator cache_i, replica::memtable_entry& mem_e, partition_presence_checker& is_present,
             real_dirty_memory_accounter& acc, const partitions_type::bound_hint& hint) mutable {
         // If cache doesn't contain the entry we cannot insert it because the mutation may be incomplete.
@@ -1046,8 +1050,8 @@ future<> row_cache::update(external_updater eu, replica::memtable& m) {
     });
 }
 
-future<> row_cache::update_invalidating(external_updater eu, replica::memtable& m) {
-    return do_update(std::move(eu), m, [this] (logalloc::allocating_section& alloc,
+future<> row_cache::update_invalidating(external_updater& eu, replica::memtable& m) {
+    return do_update(eu, m, [this] (logalloc::allocating_section& alloc,
         row_cache::partitions_type::iterator cache_i, replica::memtable_entry& mem_e, partition_presence_checker& is_present,
         real_dirty_memory_accounter& acc, const partitions_type::bound_hint&)
     {
@@ -1112,26 +1116,46 @@ void row_cache::invalidate_locked(const dht::decorated_key& dk) {
     }
 }
 
-future<> row_cache::invalidate(external_updater eu, const dht::decorated_key& dk) {
-    return invalidate(std::move(eu), dht::partition_range::make_singular(dk));
+row_cache::external_updater row_cache::noop_external_updater([]{});
+
+future<> row_cache::invalidate(external_updater& eu, const dht::decorated_key& dk) noexcept {
+ try {
+    return invalidate(eu, dht::partition_range::make_singular(dk));
+ } catch (...) {
+    return invalidate_on_error(eu, std::current_exception());
+ }
 }
 
-future<> row_cache::invalidate(external_updater eu, const dht::partition_range& range) {
-    return invalidate(std::move(eu), dht::partition_range_vector({range}));
+future<> row_cache::invalidate(external_updater& eu, const dht::partition_range& range) noexcept {
+ try {
+    return invalidate(eu, dht::partition_range_vector({range}));
+ } catch (...) {
+    return invalidate_on_error(eu, std::current_exception());
+ }
 }
 
-future<> row_cache::invalidate(external_updater eu, dht::partition_range_vector&& ranges) {
-    return do_update(std::move(eu), [this, ranges = std::move(ranges)] {
-        return seastar::async([this, ranges = std::move(ranges)] {
+future<> row_cache::invalidate(external_updater& eu, dht::partition_range_vector&& ranges) noexcept {
+    try {
+        utils::get_local_injector().inject("row_cache.invalidate.0", [] {
+            auto msg = "row_cache.invalidate.0 injection";
+            clogger.warn("{}", msg);
+            throw std::runtime_error(msg);
+        });
+        return do_update(eu, [this, ranges = std::move(ranges)] () -> future<> {
             auto on_failure = defer([this] () noexcept {
                 this->clear_now();
                 _prev_snapshot_pos = {};
                 _prev_snapshot = {};
             });
 
+            utils::get_local_injector().inject("row_cache.invalidate.1", [] {
+                auto msg = "row_cache.invalidate.1 injection";
+                clogger.warn("{}", msg);
+                throw std::runtime_error(msg);
+            });
             for (auto&& range : ranges) {
                 _prev_snapshot_pos = dht::ring_position_view::for_range_start(range);
-                seastar::thread::maybe_yield();
+                co_await coroutine::maybe_yield();
 
                 while (true) {
                     auto done = _update_section(_tracker.region(), [&] {
@@ -1164,12 +1188,24 @@ future<> row_cache::invalidate(external_updater eu, dht::partition_range_vector&
                     }
                     // _prev_snapshot_pos must be updated at this point such that every position < _prev_snapshot_pos
                     // is already invalidated and >= _prev_snapshot_pos is not yet invalidated.
-                    seastar::thread::yield();
+                    co_await yield();
                 }
             }
 
             on_failure.cancel();
         });
+    } catch (...) {
+        return invalidate_on_error(eu, std::current_exception());
+    }
+}
+
+future<> row_cache::invalidate_on_error(external_updater& eu, std::exception_ptr ex) noexcept {
+    clogger.warn("Invalidate failed: {}. Clearing the cache.", std::move(ex));
+    return do_update(eu, [this] {
+        this->clear_now();
+        _prev_snapshot_pos = {};
+        _prev_snapshot = {};
+        return make_ready_future<>();
     });
 }
 
@@ -1334,32 +1370,36 @@ std::ostream& operator<<(std::ostream& out, row_cache& rc) {
     return out;
 }
 
-future<> row_cache::do_update(row_cache::external_updater eu, row_cache::internal_updater iu) noexcept {
-  // FIXME: indentation
-  return do_with(std::move(eu), std::move(iu), [this] (auto& eu, auto& iu) {
-    return futurize_invoke([this] {
-        return get_units(_update_sem, 1);
-    }).then([this, &eu, &iu] (auto permit) mutable {
-      return eu.prepare().then([this, &eu, &iu, permit = std::move(permit)] () mutable {
-        auto pos = dht::ring_position::min();
-        eu.execute();
-        [&] () noexcept {
-            _prev_snapshot_pos = std::move(pos);
-            _prev_snapshot = std::exchange(_underlying, _snapshot_source());
-            ++_underlying_phase;
-        }();
-        return futurize_invoke([&iu] {
-            return iu();
-        }).then_wrapped([this, permit = std::move(permit)] (auto f) {
-            _prev_snapshot_pos = {};
-            _prev_snapshot = {};
-            if (f.failed()) {
-                clogger.warn("Failure during cache update: {}", f.get_exception());
-            }
-        });
-      });
+future<> row_cache::do_update(row_cache::external_updater& eu, row_cache::internal_updater iu) noexcept {
+    utils::get_local_injector().inject("row_cache.do_update.0", [] {
+        auto msg = "row_cache.do_update.0 injection";
+        clogger.warn("{}", msg);
+        throw std::runtime_error(msg);
     });
-  });
+    auto permit = co_await get_units(_update_sem, 1);
+    co_await eu.prepare();
+    auto pos = dht::ring_position::min();
+    eu.execute();
+    // No failures are allowed past this point
+    // as external_updater::execute must be called exactly once on success
+    // or none if failed before getting here.
+    [&] () noexcept {
+        _prev_snapshot_pos = std::move(pos);
+        _prev_snapshot = std::exchange(_underlying, _snapshot_source());
+        ++_underlying_phase;
+    }();
+    // All errors from the internal_updater are ignored.
+    // internal_updater must have strong failure guarantees
+    // Upon failure, it should still leave the cache
+    // in a state consistent with the update it is performing.
+    auto f = co_await coroutine::as_future(futurize_invoke([&iu] {
+        return iu();
+    }));
+    _prev_snapshot_pos = {};
+    _prev_snapshot = {};
+    if (f.failed()) {
+        clogger.warn("Failure during cache update: {}", f.get_exception());
+    }
 }
 
 std::ostream& operator<<(std::ostream& out, const cache_entry& e) {
