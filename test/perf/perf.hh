@@ -23,6 +23,7 @@
 #include <chrono>
 #include <iosfwd>
 #include <boost/range/irange.hpp>
+#include <fmt/ostream.h>
 
 template <typename Func>
 static
@@ -282,3 +283,6 @@ public:
 };
 
 } // namespace perf
+
+template <> struct fmt::formatter<scheduling_latency_measurer> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<perf_result> : fmt::ostream_formatter {};
