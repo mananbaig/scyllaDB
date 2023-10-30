@@ -97,7 +97,8 @@ public:
             return messaging_service::no_wait();
         });
 
-        ms.register_gossip_shutdown([] (inet_address from, rpc::optional<int64_t> generation_number_opt) {
+        ms.register_gossip_shutdown([] (const rpc::client_info& cinfo, inet_address, rpc::optional<int64_t> generation_number_opt) {
+            auto from = netw::messaging_service::get_source(cinfo);
             fmt::print("Server got shutdown msg = {}\n", from);
             return messaging_service::no_wait();
         });
@@ -172,6 +173,7 @@ int main(int ac, char ** av) {
         bool stay_alive = config["stay-alive"].as<bool>();
         const gms::inet_address listen = gms::inet_address(config["listen-address"].as<std::string>());
         utils::fb_utilities::set_broadcast_address(listen);
+        utils::fb_utilities::set_host_id(locator::host_id::create_random_id());
         seastar::sharded<netw::messaging_service> messaging;
         return messaging.start(locator::host_id{}, listen, 7000).then([config, stay_alive, &messaging] () {
             auto testers = new distributed<tester>;

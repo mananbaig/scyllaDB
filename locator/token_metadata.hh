@@ -31,6 +31,7 @@
 
 #include "locator/types.hh"
 #include "locator/topology.hh"
+#include "gms/endpoint_id.hh"
 
 // forward declaration since replica/database.hh includes this file
 namespace replica {
@@ -63,7 +64,7 @@ struct host_id_or_endpoint {
     }
 
     bool has_endpoint() const noexcept {
-        return endpoint != gms::inet_address();
+        return bool(endpoint);
     }
 
     // Map the host_id to endpoint based on whichever of them is set,
@@ -131,6 +132,12 @@ public:
     const std::unordered_map<token, inet_address>& get_bootstrap_tokens() const;
 
     /**
+     * Update or add endpoint given its host_id, inet_address and endpoint_dc_rack.
+     */
+    void update_topology(host_id host_id, inet_address ep, std::optional<endpoint_dc_rack> opt_dr, std::optional<node::state> opt_st = std::nullopt,
+                         std::optional<shard_id> shard_count = std::nullopt);
+
+    /**
      * Update or add endpoint given its inet_address and endpoint_dc_rack.
      */
     void update_topology(inet_address ep, std::optional<endpoint_dc_rack> opt_dr, std::optional<node::state> opt_st = std::nullopt,
@@ -162,6 +169,9 @@ public:
      * @param endpoint
      */
     void update_host_id(const locator::host_id& host_id, inet_address endpoint);
+    void update_host_id(const gms::endpoint_id& node) {
+        update_host_id(node.host_id, node.addr);
+    }
 
     /** Return the unique host ID for an end-point. */
     host_id get_host_id(inet_address endpoint) const;
