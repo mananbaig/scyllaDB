@@ -225,6 +225,9 @@ future<> run_table_tasks(replica::database& db, std::vector<table_tasks_info> ta
     // Thus, they are sorted before each individual compaction and the smallest table is chosen.
     while (!table_tasks.empty()) {
         try {
+            if (table_tasks.size() == 1 && utils::get_local_injector().enter("compaction_run_table_tasks")) {
+                throw std::runtime_error("compaction_run_table_tasks");
+            }
             if (sort) {
                 // Major compact smaller tables first, to increase chances of success if low on space.
                 // Tables will be kept in descending order.
