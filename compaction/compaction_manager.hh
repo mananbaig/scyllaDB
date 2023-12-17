@@ -71,6 +71,15 @@ inline owned_ranges_ptr make_owned_ranges_ptr(dht::token_range_vector&& ranges) 
 }
 
 }
+
+template<typename T>
+struct config_updater {
+    serialized_action action;
+    utils::observer<T> observer;
+
+    config_updater(utils::updateable_value<T>& cfg, std::function<future<>()> action);
+};
+
 // Compaction manager provides facilities to submit and track compaction jobs on
 // behalf of existing tables.
 class compaction_manager {
@@ -88,6 +97,8 @@ public:
         scheduling_group maintenance_sched_group;
         size_t available_memory = 0;
         utils::updateable_value<float> static_shares = utils::updateable_value<float>(0);
+        utils::updateable_value<float> max_shares = utils::updateable_value<float>(0);
+        utils::updateable_value<float> backlog_sensitivity = utils::updateable_value<float>(0);
         utils::updateable_value<uint32_t> throughput_mb_per_sec = utils::updateable_value<uint32_t>(0);
     };
 
@@ -158,8 +169,10 @@ private:
     optimized_optional<abort_source::subscription> _early_abort_subscription;
     serialized_action _throughput_updater;
     std::optional<utils::observer<uint32_t>> _throughput_option_observer;
-    serialized_action _update_compaction_static_shares_action;
-    utils::observer<float> _compaction_static_shares_observer;
+    config_updater<float> _compaction_static_shares_updater;
+    config_updater<float> _compaction_max_shares_updater;
+    config_updater<float> _compaction_backlog_sensitivity_updater;
+
     uint64_t _validation_errors = 0;
 
     class strategy_control;
@@ -235,6 +248,8 @@ private:
 
     future<compaction_stats_opt> perform_sstable_scrub_validate_mode(compaction::table_state& t, std::optional<tasks::task_info> info);
     future<> update_static_shares(float shares);
+    future<> update_max_shares(float shares);
+    future<> update_backlog_sensitivity(float sensitivity);
 
     using get_candidates_func = std::function<future<std::vector<sstables::shared_sstable>>()>;
 
@@ -282,6 +297,14 @@ public:
 
     float static_shares() const noexcept {
         return _cfg.static_shares.get();
+    }
+
+    float max_shares() const noexcept {
+        return _cfg.max_shares.get();
+    }
+
+    float backlog_sensitivity() const noexcept {
+        return _cfg.backlog_sensitivity.get();
     }
 
     uint32_t throughput_mbs() const noexcept {

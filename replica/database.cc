@@ -418,6 +418,10 @@ locator::vnode_effective_replication_map_ptr keyspace::get_effective_replication
 
 } // namespace replica
 
+float backlog_controller::slope(const control_point cp1, const control_point& cp2) {
+    return (cp2.output - cp1.output) / (cp2.input - cp1.input);
+}
+
 void backlog_controller::adjust() {
     if (controller_disabled()) {
         update_controller(_static_shares);
@@ -440,7 +444,7 @@ void backlog_controller::adjust() {
 
     control_point& cp = _control_points[idx];
     control_point& last = _control_points[idx - 1];
-    float result = last.output + (backlog - last.input) * (cp.output - last.output)/(cp.input - last.input);
+    float result = last.output + (backlog - last.input) * slope(last, cp);
     update_controller(result);
 }
 
@@ -467,6 +471,64 @@ void backlog_controller::update_controller(float shares) {
     _scheduling_group.set_shares(shares);
 }
 
+constexpr backlog_controller::control_point compaction_controller::middle_point() {
+    return { 1.5, 100 };
+}
+constexpr backlog_controller::control_point compaction_controller::base_last_point() {
+    return { base_normalization_factor, 1000 };
+}
+
+const float compaction_controller::minimum_effective_max_shares() {
+    return middle_point().output * 2;
+}
+const float compaction_controller::default_max_shares() {
+    return base_last_point().output;
+}
+
+const float compaction_controller::min_normalization_factor() {
+    return middle_point().input * 2;
+}
+
+const float compaction_controller::max_backlog_sensitivity(float max_shares) {
+    auto base_slope = slope(middle_point(), base_last_point());
+
+    // To find the maximum sensitivity, given max_shares, we rewrite formula
+    //      NF = (y2 – y1) / (sensitivity * m) + x1
+    //  into
+    //      sensitivity = (y2 – y1) / (NF - x1) / m
+    return (max_shares - middle_point().output) / (min_normalization_factor() - middle_point().input) / base_slope;
+}
+
+backlog_controller::control_point compaction_controller::last_control_point(float max_shares, float backlog_sensitivity) {
+    max_shares = std::max(max_shares, minimum_effective_max_shares());
+    auto sensitivity = std::clamp(backlog_sensitivity, min_backlog_sensitivity, max_backlog_sensitivity(max_shares));
+
+    auto base_slope = slope(middle_point(), base_last_point());
+
+    // To preserve the same slope with different max shares config,
+    // we rewrite the formula for finding slope
+    //      m = (y2 – y1) / (x2 – x1)
+    //  into
+    //      x2 = (y2 – y1) / m + x1
+    // For finding x2 (or normalization factor), we replace m by
+    // the constant slope with default max shares (1000).
+    float nf = (max_shares - middle_point().output) / (sensitivity * base_slope) + middle_point().input;
+
+    dblog.debug("compaction_controller: calculated normalization factor of {} for max shares of {}", nf, max_shares);
+
+    return control_point{ nf, max_shares };
+}
+
+compaction_controller::compaction_controller(config cfg, std::function<float()> current_backlog)
+    : backlog_controller(std::move(cfg.sg), std::move(cfg.interval),
+        std::vector<backlog_controller::control_point>({{0.0, 50},
+                                                        middle_point(),
+                                                        last_control_point(cfg.max_shares, cfg.backlog_sensitivity)}),
+        std::move(current_backlog),
+        cfg.static_shares)
+    , _backlog_sensitivity(cfg.backlog_sensitivity)
+{
+}
 
 namespace replica {
 

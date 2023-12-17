@@ -997,6 +997,8 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                     .maintenance_sched_group = compaction_manager::scheduling_group{dbcfg.streaming_scheduling_group},
                     .available_memory = dbcfg.available_memory,
                     .static_shares = cfg->compaction_static_shares,
+                    .max_shares = cfg->compaction_max_shares,
+                    .backlog_sensitivity = cfg->compaction_backlog_sensitivity,
                     .throughput_mb_per_sec = cfg->compaction_throughput_mb_per_sec,
                 };
             });
