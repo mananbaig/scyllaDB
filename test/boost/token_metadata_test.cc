@@ -16,6 +16,7 @@ using namespace locator;
 
 namespace {
     const auto ks_name = sstring("test-ks");
+    locator::topology_registry topology_registry;
 
     host_id gen_id(int id) {
         return host_id{utils::UUID(0, id)};
@@ -29,7 +30,7 @@ namespace {
     }
 
     mutable_token_metadata_ptr create_token_metadata(host_id this_host_id) {
-        return make_lw_shared<token_metadata>(token_metadata::config {
+        return make_lw_shared<token_metadata>(std::ref(topology_registry), token_metadata::config {
             topology::config {
                 .this_host_id = this_host_id,
                 .local_dc_rack = get_dc_rack(this_host_id)
@@ -41,7 +42,7 @@ namespace {
     mutable_vnode_erm_ptr create_erm(mutable_token_metadata_ptr tmptr, replication_strategy_config_options opts = {}) {
         dc_rack_fn get_dc_rack_fn = get_dc_rack;
         tmptr->update_topology_change_info(get_dc_rack_fn).get();
-        auto strategy = seastar::make_shared<Strategy>(replication_strategy_params(opts, std::nullopt));
+        auto strategy = seastar::make_shared<Strategy>(tmptr->get_topology(), replication_strategy_params(opts, std::nullopt));
         return calculate_effective_replication_map(std::move(strategy), tmptr).get();
     }
 }

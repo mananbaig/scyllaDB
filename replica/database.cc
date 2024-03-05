@@ -1182,12 +1182,13 @@ keyspace::create_replication_strategy(const locator::shared_token_metadata& stm)
     using namespace locator;
 
     locator::replication_strategy_params params(_metadata->strategy_options(), _metadata->initial_tablets());
+    auto tmptr = stm.get();
     _replication_strategy =
-            abstract_replication_strategy::create_replication_strategy(_metadata->strategy_name(), params);
+            abstract_replication_strategy::create_replication_strategy(_metadata->strategy_name(), tmptr->get_topology(), params);
     rslogger.debug("replication strategy for keyspace {} is {}, opts={}",
             _metadata->name(), _metadata->strategy_name(), _metadata->strategy_options());
     if (!_replication_strategy->is_per_table()) {
-        auto erm = co_await _erm_factory.create_effective_replication_map(_replication_strategy, stm.get());
+        auto erm = co_await _erm_factory.create_effective_replication_map(_replication_strategy, std::move(tmptr));
         update_effective_replication_map(std::move(erm));
     }
 }
@@ -2589,8 +2590,7 @@ const sstring& database::get_snitch_name() const {
 }
 
 dht::token_range_vector database::get_keyspace_local_ranges(sstring ks) {
-    auto my_address = get_token_metadata().get_topology().my_address();
-    return find_keyspace(ks).get_vnode_effective_replication_map()->get_ranges(my_address);
+    return find_keyspace(ks).get_vnode_effective_replication_map()->get_ranges();
 }
 
 std::optional<dht::token_range_vector> database::maybe_get_keyspace_local_ranges(sstring ks) {
@@ -2599,8 +2599,7 @@ std::optional<dht::token_range_vector> database::maybe_get_keyspace_local_ranges
         // return nullopt if each tables have their own effective_replication_map
         return std::nullopt;
     }
-    auto my_address = get_token_metadata().get_topology().my_address();
-    return keyspace.get_vnode_effective_replication_map()->get_ranges(my_address);
+    return keyspace.get_vnode_effective_replication_map()->get_ranges();
 }
 
 /*!

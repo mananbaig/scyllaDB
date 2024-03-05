@@ -8,6 +8,7 @@
 
 #include "locator/abstract_replication_strategy.hh"
 #include "locator/tablet_replication_strategy.hh"
+#include "locator/topology.hh"
 #include "utils/class_registrator.hh"
 #include "exceptions/exceptions.hh"
 #include <boost/range/algorithm/remove_if.hpp>
@@ -35,14 +36,23 @@ static ResultSet resolve_endpoints(const SourceSet& host_ids, const token_metada
 logging::logger rslogger("replication_strategy");
 
 abstract_replication_strategy::abstract_replication_strategy(
-    replication_strategy_params params,
-    replication_strategy_type my_type)
-        : _config_options(params.options)
-        , _my_type(my_type) {}
+    abstract_replication_strategy_traits traits,
+    replication_strategy_params params)
+        : _traits(traits)
+        , _config_options(params.options)
+{}
 
-abstract_replication_strategy::ptr_type abstract_replication_strategy::create_replication_strategy(const sstring& strategy_name, replication_strategy_params params) {
+abstract_replication_strategy::ptr_type abstract_replication_strategy::create_replication_strategy(const sstring& strategy_name, const topology& topology, replication_strategy_params params) {
     try {
-        return create_object<abstract_replication_strategy, replication_strategy_params>(strategy_name, std::move(params));
+        return strategy_class_registry::create(strategy_name, topology, std::move(params));
+    } catch (const no_such_class& e) {
+        throw exceptions::configuration_exception(e.what());
+    }
+}
+
+abstract_replication_strategy_traits::ptr_type abstract_replication_strategy::create_replication_strategy_traits(const sstring& strategy_name, const replication_strategy_params& params) {
+    try {
+        return strategy_class_traits_registry::create(strategy_name, params);
     } catch (const no_such_class& e) {
         throw exceptions::configuration_exception(e.what());
     }
@@ -54,7 +64,7 @@ void abstract_replication_strategy::validate_replication_strategy(const sstring&
                                                                   const gms::feature_service& fs,
                                                                   const topology& topology)
 {
-    auto strategy = create_replication_strategy(strategy_name, params);
+    auto strategy = create_replication_strategy(strategy_name, topology, params);
     strategy->validate_options(fs);
     auto expected = strategy->recognized_options(topology);
     if (expected) {
@@ -71,10 +81,6 @@ future<endpoint_set> abstract_replication_strategy::calculate_natural_ips(const 
     const auto host_ids = co_await calculate_natural_endpoints(search_token, tm);
     co_return resolve_endpoints<endpoint_set>(host_ids, tm);
 }
-
-using strategy_class_registry = class_registry<
-    locator::abstract_replication_strategy,
-    replication_strategy_params>;
 
 sstring abstract_replication_strategy::to_qualified_class_name(std::string_view strategy_class_name) {
     return strategy_class_registry::to_qualified_class_name(strategy_class_name);
@@ -169,14 +175,14 @@ const dht::sharder& vnode_effective_replication_map::get_sharder(const schema& s
 }
 
 const per_table_replication_strategy* abstract_replication_strategy::maybe_as_per_table() const {
-    if (!_per_table) {
+    if (!is_per_table()) {
         return nullptr;
     }
     return dynamic_cast<const per_table_replication_strategy*>(this);
 }
 
 const tablet_aware_replication_strategy* abstract_replication_strategy::maybe_as_tablet_aware() const {
-    if (!_uses_tablets) {
+    if (!uses_tablets()) {
         return nullptr;
     }
     return dynamic_cast<const tablet_aware_replication_strategy*>(this);
@@ -227,7 +233,7 @@ insert_token_range_to_sorted_container_while_unwrapping(
 }
 
 dht::token_range_vector
-vnode_effective_replication_map::do_get_ranges(noncopyable_function<stop_iteration(bool&, const inet_address&)> consider_range_for_endpoint) const {
+vnode_effective_replication_map::do_get_ranges(noncopyable_function<stop_iteration(bool&, const node*)> consider_range_for_endpoint) const {
     dht::token_range_vector ret;
     const auto& tm = *_tmptr;
     const auto& sorted_tokens = tm.sorted_tokens();
@@ -237,7 +243,7 @@ vnode_effective_replication_map::do_get_ranges(noncopyable_function<stop_iterati
     auto prev_tok = sorted_tokens.back();
     for (const auto& tok : sorted_tokens) {
         bool add_range = false;
-        for_each_natural_endpoint_until(tok, [&] (const inet_address& ep) {
+        for_each_natural_node_until(tok, [&] (const node* ep) {
             return consider_range_for_endpoint(add_range, ep);
         });
         if (add_range) {
@@ -249,12 +255,12 @@ vnode_effective_replication_map::do_get_ranges(noncopyable_function<stop_iterati
 }
 
 dht::token_range_vector
-vnode_effective_replication_map::get_ranges(inet_address ep) const {
+vnode_effective_replication_map::get_ranges(const node* of_node) const {
     // The callback function below is called for each endpoint
     // in each token natural endpoints.
     // Add the range if `ep` is found in the token's natural endpoints
-    return do_get_ranges([ep] (bool& add_range, const inet_address& e) {
-        if ((add_range = (e == ep))) {
+    return do_get_ranges([of_node] (bool& add_range, const node* node) {
+        if ((add_range = (node == of_node))) {
             // stop iteration a match is found
             return stop_iteration::yes;
         }
@@ -299,35 +305,33 @@ abstract_replication_strategy::get_ranges(locator::host_id ep, const token_metad
 }
 
 dht::token_range_vector
-vnode_effective_replication_map::get_primary_ranges(inet_address ep) const {
+vnode_effective_replication_map::get_primary_ranges(const node* of_node) const {
     // The callback function below is called for each endpoint
     // in each token natural endpoints.
     // Add the range if `ep` is the primary replica in the token's natural endpoints.
     // The primary replica is first in the natural endpoints list.
-    return do_get_ranges([ep] (bool& add_range, const inet_address& e) {
-        add_range = (e == ep);
+    return do_get_ranges([of_node] (bool& add_range, const node* node) {
+        add_range = (node == of_node);
         // stop the iteration once the first node was considered.
         return stop_iteration::yes;
     });
 }
 
 dht::token_range_vector
-vnode_effective_replication_map::get_primary_ranges_within_dc(inet_address ep) const {
-    const topology& topo = _tmptr->get_topology();
-    sstring local_dc = topo.get_datacenter(ep);
-    std::unordered_set<inet_address> local_dc_nodes = topo.get_datacenter_endpoints().at(local_dc);
+vnode_effective_replication_map::get_primary_ranges_within_dc(const node* of_node) const {
+    const auto* local_dc = of_node->dc();
     // The callback function below is called for each endpoint
     // in each token natural endpoints.
     // Add the range if `ep` is the datacenter primary replica in the token's natural endpoints.
     // The primary replica in each datacenter is determined by the natural endpoints list order.
-    return do_get_ranges([ep, local_dc_nodes = std::move(local_dc_nodes)] (bool& add_range, const inet_address& e) {
+    return do_get_ranges([local_dc, of_node] (bool& add_range, const auto* node) {
         // Unlike get_primary_ranges() which checks if ep is the first
         // owner of this range, here we check if ep is the first just
         // among nodes which belong to the local dc of ep.
-        if (!local_dc_nodes.contains(e)) {
+        if (node->dc() != local_dc) {
             return stop_iteration::no;
         }
-        add_range = (e == ep);
+        add_range = (node == of_node);
         // stop the iteration once the first node contained the local datacenter was considered.
         return stop_iteration::yes;
     });
@@ -490,6 +494,26 @@ auto vnode_effective_replication_map::clone_data_gently() const -> future<std::u
     result->dirty_endpoints = _dirty_endpoints;
 
     co_return std::move(result);
+}
+
+const host_id_vector_replica_set& vnode_effective_replication_map::do_get_natural_hosts(const token& tok,
+    bool is_vnode) const
+{
+    const token& key_token = _rs->natural_endpoints_depend_on_token()
+        ? (is_vnode ? tok : _tmptr->first_token(tok))
+        : default_replication_map_key;
+    const auto it = _replication_map.find(key_token);
+    return it->second;
+}
+
+stop_iteration vnode_effective_replication_map::for_each_natural_node_until(const token& vnode_tok, const noncopyable_function<stop_iteration(const node*)>& func) const {
+    const auto& topology = _tmptr->get_topology();
+    for (const auto& host_id : do_get_natural_hosts(vnode_tok, true)) {
+        if (func(topology.find_node(host_id)) == stop_iteration::yes) {
+            return stop_iteration::yes;
+        }
+    }
+    return stop_iteration::no;
 }
 
 inet_address_vector_replica_set vnode_effective_replication_map::do_get_natural_endpoints(const token& tok,

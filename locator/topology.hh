@@ -10,10 +10,13 @@
 
 #pragma once
 
+#include <boost/intrusive/link_mode.hpp>
 #include <unordered_set>
 #include <unordered_map>
 #include <compare>
 #include <iostream>
+
+#include <boost/intrusive/list.hpp>
 
 #include <seastar/core/future.hh>
 #include <seastar/core/sstring.hh>
@@ -22,6 +25,7 @@
 
 #include "locator/types.hh"
 #include "inet_address_vectors.hh"
+#include "seastar/core/sharded.hh"
 
 using namespace seastar;
 
@@ -39,6 +43,51 @@ class node;
 using node_holder = std::unique_ptr<node>;
 
 using shard_id = seastar::shard_id;
+
+struct rack {
+    sstring name;
+
+    explicit rack(sstring_view rack_name) : name(rack_name) {}
+};
+
+struct datacenter {
+    using rack_ptr = std::unique_ptr<rack>;
+    using racks_map_t = std::unordered_map<sstring_view, rack_ptr>;
+
+    sstring name;
+    racks_map_t racks;
+
+    explicit datacenter(sstring_view dc_name) : name(dc_name) {}
+};
+
+struct location {
+    const datacenter* dc = nullptr;
+    const rack* rack = nullptr;
+
+    endpoint_dc_rack get_dc_rack() const;
+};
+
+// A global service that manages datacenters and racks by name
+class topology_registry {
+public:
+    using datacenter_ptr = std::unique_ptr<datacenter>;
+    using datacenters_map_t = std::unordered_map<sstring_view, datacenter_ptr>;
+
+private:
+    datacenters_map_t _datacenters;
+
+public:
+    const datacenters_map_t& datacenters() const noexcept {
+        return _datacenters;
+    }
+
+    const datacenter* find_datacenter(sstring_view name) const noexcept;
+    location find_location(sstring_view dc_name, sstring_view rack_name) const noexcept;
+
+    // Datacenters and racks can only be created on shard 0
+    // They are kept forever, even when empty.
+    location find_or_create_location(sstring_view dc_name, sstring_view rack_name);
+};
 
 class node {
 public:
@@ -60,7 +109,7 @@ private:
     const locator::topology* _topology;
     locator::host_id _host_id;
     inet_address _endpoint;
-    endpoint_dc_rack _dc_rack;
+    location _location;
     state _state;
     shard_id _shard_count = 0;
     bool _excluded = false;
@@ -69,11 +118,14 @@ private:
     this_node _is_this_node;
     idx_type _idx = -1;
 
+    using list_hook_t = boost::intrusive::list_member_hook<boost::intrusive::link_mode<boost::intrusive::auto_unlink>>;
+    list_hook_t _dc_hook;
+    list_hook_t _rack_hook;
+
 public:
     node(const locator::topology* topology,
          locator::host_id id,
          inet_address endpoint,
-         endpoint_dc_rack dc_rack,
          state state,
          shard_id shard_count = 0,
          this_node is_this_node = this_node::no,
@@ -94,8 +146,20 @@ public:
         return _endpoint;
     }
 
-    const endpoint_dc_rack& dc_rack() const noexcept {
-        return _dc_rack;
+    const locator::location& location() const noexcept {
+        return _location;
+    }
+
+    endpoint_dc_rack dc_rack() const {
+        return _location.get_dc_rack();
+    }
+
+    const datacenter* dc() const noexcept {
+        return _location.dc;
+    }
+
+    const rack* rack() const noexcept {
+        return _location.rack;
     }
 
     // Is this "localhost"?
@@ -153,7 +217,6 @@ private:
     static node_holder make(const locator::topology* topology,
                             locator::host_id id,
                             inet_address endpoint,
-                            endpoint_dc_rack dc_rack,
                             state state,
                             shard_id shard_count = 0,
                             node::this_node is_this_node = this_node::no,
@@ -179,15 +242,34 @@ public:
 
         bool operator==(const config&) const = default;
     };
-    topology(config cfg);
+    topology(topology_registry& topology_registry, config cfg);
     topology(topology&&) noexcept;
 
     topology& operator=(topology&&) noexcept;
 
+    // Note: must be called on shard 0
     future<topology> clone_gently() const;
     future<> clear_gently() noexcept;
 
 public:
+    struct datacenter_inventory {
+        using dc_nodes_list_t = boost::intrusive::list<node,
+            boost::intrusive::member_hook<node, node::list_hook_t, &node::_dc_hook>,
+            boost::intrusive::constant_time_size<false>>;
+        dc_nodes_list_t nodes;
+        size_t node_count;
+
+        using rack_nodes_list_t = boost::intrusive::list<node,
+            boost::intrusive::member_hook<node, node::list_hook_t, &node::_rack_hook>,
+            boost::intrusive::constant_time_size<false>>;
+        std::unordered_map<const rack*, rack_nodes_list_t> racks;
+    };
+    using inventory_map = std::unordered_map<const datacenter*, datacenter_inventory>;
+
+    topology_registry& get_topology_registry() const noexcept {
+        return _topology_registry;
+    }
+
     const config& get_config() const noexcept { return _cfg; }
 
     void set_host_id_cfg(host_id this_host_id) {
@@ -199,12 +281,16 @@ public:
     }
 
     // Adds a node with given host_id, endpoint, and DC/rack.
+    //
+    // Note: must be called on shard 0
     const node* add_node(host_id id, const inet_address& ep, const endpoint_dc_rack& dr, node::state state,
                          shard_id shard_count = 0);
 
     // Optionally updates node's current host_id, endpoint, or DC/rack.
     // Note: the host_id may be updated from null to non-null after a new node gets a new, random host_id,
     // or a peer node host_id may be updated when the node is replaced with another node using the same ip address.
+    //
+    // Note: must be called on shard 0
     const node* update_node(node* node,
                             std::optional<host_id> opt_id,
                             std::optional<inet_address> opt_ep,
@@ -214,6 +300,8 @@ public:
 
     // Removes a node using its host_id
     // Returns true iff the node was found and removed.
+    //
+    // Note: must be called on shard 0
     bool remove_node(host_id id);
 
     // Looks up a node by its host_id.
@@ -245,12 +333,15 @@ public:
      * Stores current DC/rack assignment for ep
      *
      * Adds or updates a node with given endpoint
+     *
+     * Note: must be called on shard 0
      */
     const node* add_or_update_endpoint(host_id id, std::optional<inet_address> opt_ep,
                                        std::optional<endpoint_dc_rack> opt_dr = std::nullopt,
                                        std::optional<node::state> opt_st = std::nullopt,
                                        std::optional<shard_id> shard_count = std::nullopt);
 
+    // Note: must be called on shard 0
     bool remove_endpoint(locator::host_id ep);
 
     /**
@@ -258,69 +349,84 @@ public:
      */
     bool has_endpoint(inet_address) const;
 
-    const std::unordered_map<sstring,
-                           std::unordered_set<inet_address>>&
-    get_datacenter_endpoints() const {
-        return _dc_endpoints;
+    // Return the total number of nodes.
+    size_t node_count() const noexcept {
+        return _nodes.size();
     }
 
-    const std::unordered_map<sstring,
-                            std::unordered_set<const node*>>&
-    get_datacenter_nodes() const {
-        return _dc_nodes;
+    // Return the number of nodes in the datacenter.
+    // datacenter must exist in topology.
+    size_t node_count(const datacenter* dc) const {
+        return _inventory_map.at(dc).node_count;
     }
 
-    const std::unordered_map<sstring,
+    std::unordered_map<sstring,
+                           std::unordered_set<inet_address>>
+    get_datacenter_endpoints() const;
+
+    std::unordered_map<sstring,
+                            std::unordered_set<const node*>>
+    get_datacenter_nodes() const;
+
+    std::unordered_map<sstring,
                        std::unordered_map<sstring,
-                                          std::unordered_set<inet_address>>>&
-    get_datacenter_racks() const {
-        return _dc_racks;
+                                          std::unordered_set<inet_address>>>
+    get_datacenter_racks() const;
+
+    std::unordered_set<sstring> get_datacenter_names() const noexcept;
+
+    const datacenter* find_datacenter(sstring_view name) const noexcept {
+        if (const auto* dc = _topology_registry.find_datacenter(name); _inventory_map.contains(dc)) {
+            return dc;
+        }
+        return nullptr;
     }
 
-    const std::unordered_set<sstring>& get_datacenters() const noexcept {
-        return _datacenters;
+    const inventory_map& get_inventory() const noexcept {
+        return _inventory_map;
     }
 
     // Get dc/rack location of this node
-    const endpoint_dc_rack& get_location() const noexcept {
-        return _this_node ? _this_node->dc_rack() : _cfg.local_dc_rack;
+    location get_location() const {
+        return _this_node ? _this_node->location() :
+                _topology_registry.find_or_create_location(_cfg.local_dc_rack.dc, _cfg.local_dc_rack.rack);
     }
     // Get dc/rack location of a node identified by host_id
     // The specified node must exist.
-    const endpoint_dc_rack& get_location(host_id id) const {
-        return find_node(id)->dc_rack();
+    location get_location(host_id id) const {
+        return find_node(id)->location();
     }
     // Get dc/rack location of a node identified by endpoint
     // The specified node must exist.
-    const endpoint_dc_rack& get_location(const inet_address& ep) const;
+    location get_location(const inet_address& ep) const;
 
     // Get datacenter of this node
-    const sstring& get_datacenter() const noexcept {
+    const datacenter* get_datacenter() const noexcept {
         return get_location().dc;
     }
     // Get datacenter of a node identified by host_id
     // The specified node must exist.
-    const sstring& get_datacenter(host_id id) const {
+    const datacenter* get_datacenter(host_id id) const {
         return get_location(id).dc;
     }
     // Get datacenter of a node identified by endpoint
     // The specified node must exist.
-    const sstring& get_datacenter(inet_address ep) const {
+    const datacenter* get_datacenter(inet_address ep) const {
         return get_location(ep).dc;
     }
 
     // Get rack of this node
-    const sstring& get_rack() const noexcept {
+    const rack* get_rack() const noexcept {
         return get_location().rack;
     }
     // Get rack of a node identified by host_id
     // The specified node must exist.
-    const sstring& get_rack(host_id id) const {
+    const rack* get_rack(host_id id) const {
         return get_location(id).rack;
     }
     // Get rack of a node identified by endpoint
     // The specified node must exist.
-    const sstring& get_rack(inet_address ep) const {
+    const rack* get_rack(inet_address ep) const {
         return get_location(ep).rack;
     }
 
@@ -342,6 +448,9 @@ public:
     void sort_by_proximity(inet_address address, inet_address_vector_replica_set& addresses) const;
 
     void for_each_node(std::function<void(const node*)> func) const;
+
+    // Call func for every node in the datacenter
+    void for_each_node(const datacenter*, std::function<void(const node*)> func) const;
 
     host_id my_host_id() const noexcept {
         return _cfg.this_host_id;
@@ -365,14 +474,14 @@ public:
 
 private:
     bool is_configured_this_node(const node&) const;
-    const node* add_node(node_holder node);
+    const node* add_node(node_holder node, const endpoint_dc_rack& dc_rack);
     void remove_node(const node* node);
 
     static std::string debug_format(const node*);
 
-    void index_node(const node* node);
-    void unindex_node(const node* node);
-    node_holder pop_node(const node* node);
+    void index_node(node* node, const endpoint_dc_rack& dr);
+    void unindex_node(node* node);
+    node_holder pop_node(node* node);
 
     static node* make_mutable(const node* nptr) {
         return const_cast<node*>(nptr);
@@ -390,32 +499,16 @@ private:
     std::weak_ordering compare_endpoints(const inet_address& address, const inet_address& a1, const inet_address& a2) const;
 
     unsigned _shard;
+    topology_registry& _topology_registry;
     config _cfg;
     const node* _this_node = nullptr;
     std::vector<node_holder> _nodes;
     std::unordered_map<host_id, const node*> _nodes_by_host_id;
     std::unordered_map<inet_address, const node*> _nodes_by_endpoint;
 
-    std::unordered_map<sstring, std::unordered_set<const node*>> _dc_nodes;
-    std::unordered_map<sstring, std::unordered_map<sstring, std::unordered_set<const node*>>> _dc_rack_nodes;
-
-    /** multi-map: DC -> endpoints in that DC */
-    std::unordered_map<sstring,
-                       std::unordered_set<inet_address>>
-        _dc_endpoints;
-
-    /** map: DC -> (multi-map: rack -> endpoints in that rack) */
-    std::unordered_map<sstring,
-                       std::unordered_map<sstring,
-                                          std::unordered_set<inet_address>>>
-        _dc_racks;
+    inventory_map _inventory_map;
 
     bool _sort_by_proximity = true;
-
-    // pre-calculated
-    std::unordered_set<sstring> _datacenters;
-
-    void calculate_datacenters();
 
     const std::unordered_map<inet_address, const node*>& get_nodes_by_endpoint() const noexcept {
         return _nodes_by_endpoint;
@@ -459,12 +552,12 @@ struct fmt::formatter<locator::node> : fmt::formatter<std::string_view> {
         if (!verbose) {
             return fmt::format_to(ctx.out(), "{}/{}", node.host_id(), node.endpoint());
         } else {
-            return fmt::format_to(ctx.out(), " idx={} host_id={} endpoint={} dc={} rack={} state={} shards={} this_node={}",
+            return fmt::format_to(ctx.out(), "idx={} host_id={} endpoint={} dc={} rack={} state={} shards={} this_node={}",
                     node.idx(),
                     node.host_id(),
                     node.endpoint(),
-                    node.dc_rack().dc,
-                    node.dc_rack().rack,
+                    node.location().dc ? node.location().dc->name : "",
+                    node.location().rack ? node.location().rack->name : "",
                     locator::node::to_string(node.get_state()),
                     node.get_shard_count(),
                     bool(node.is_this_node()));

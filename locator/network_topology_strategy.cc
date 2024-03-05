@@ -16,6 +16,7 @@
 #include "locator/network_topology_strategy.hh"
 #include "locator/load_sketch.hh"
 #include <boost/algorithm/string.hpp>
+#include <boost/range/adaptors.hpp>
 #include "exceptions/exceptions.hh"
 #include "utils/class_registrator.hh"
 #include "utils/hash.hh"
@@ -31,11 +32,22 @@ struct hash<locator::endpoint_dc_rack> {
 
 namespace locator {
 
-network_topology_strategy::network_topology_strategy(replication_strategy_params params) :
-        abstract_replication_strategy(params,
-                                      replication_strategy_type::network_topology) {
+network_topology_strategy_traits::network_topology_strategy_traits(const replication_strategy_params& params)
+    : abstract_replication_strategy_traits(params.initial_tablets.has_value() ?
+        abstract_replication_strategy_traits(replication_strategy_type::network_topology,
+                abstract_replication_strategy_traits::local::no,
+                abstract_replication_strategy_traits::per_table::yes,
+                abstract_replication_strategy_traits::tablets::yes) :
+        abstract_replication_strategy_traits(replication_strategy_type::network_topology)
+    )
+{}
+
+network_topology_strategy::network_topology_strategy(const topology& topology, replication_strategy_params params)
+        : abstract_replication_strategy(network_topology_strategy_traits(params), params)
+        , _topology_registry(topology.get_topology_registry())
+{
     auto opts = _config_options;
-    process_tablet_options(*this, opts, params);
+    process_tablet_options(params);
 
     size_t rep_factor = 0;
     for (auto& config_pair : opts) {
@@ -56,18 +68,26 @@ network_topology_strategy::network_topology_strategy(replication_strategy_params
                 "NetworkTopologyStrategy");
         }
 
+        const auto* dc = _topology_registry.find_datacenter(key);
+        if (!dc) {
+            // Ignore the option.  It will be checked again later when validated.
+            rslogger.warn("Could not find datacenter {} with replication factor {}", key, val);
+            continue;
+        }
+
         auto rf = parse_replication_factor(val);
         rep_factor += rf;
-        _dc_rep_factor.emplace(key, rf);
-        _datacenteres.push_back(key);
+        _dc_rep_factor.emplace(dc, rf);
     }
 
     _rep_factor = rep_factor;
 
-    rslogger.debug("Configured datacenter replicas are: {}", _dc_rep_factor);
+    rslogger.debug("Configured datacenter replicas are: {}", boost::copy_range<std::unordered_map<sstring, size_t>>(_dc_rep_factor | boost::adaptors::transformed([] (const auto& x) {
+        return std::make_pair(x.first->name, x.second);
+    })));
 }
 
-using endpoint_dc_rack_set = std::unordered_set<endpoint_dc_rack>;
+using rack_set = std::unordered_set<const rack*>;
 
 class natural_endpoints_tracker {
     /**
@@ -82,13 +102,13 @@ class natural_endpoints_tracker {
          * For efficiency the set is shared between the instances, using the location pair (dc, rack) to make sure
          * clashing names aren't a problem.
          */
-        endpoint_dc_rack_set& _racks;
+        rack_set& _racks;
 
         /** Number of replicas left to fill from this DC. */
         size_t _rf_left;
         ssize_t _acceptable_rack_repeats;
 
-        data_center_endpoints(size_t rf, size_t rack_count, size_t node_count, host_id_set& endpoints, endpoint_dc_rack_set& racks)
+        data_center_endpoints(size_t rf, size_t rack_count, size_t node_count, host_id_set& endpoints, rack_set& racks)
             : _endpoints(endpoints)
             , _racks(racks)
             // If there aren't enough nodes in this DC to fill the RF, the number of nodes is the effective RF.
@@ -102,12 +122,12 @@ class natural_endpoints_tracker {
          * Attempts to add an endpoint to the replicas for this datacenter, adding to the endpoints set if successful.
          * Returns true if the endpoint was added, and this datacenter does not require further replicas.
          */
-        bool add_endpoint_and_check_if_done(const host_id& ep, const endpoint_dc_rack& location) {
+        bool add_endpoint_and_check_if_done(const host_id& ep, const location& location) {
             if (done()) {
                 return false;
             }
 
-            if (_racks.emplace(location).second) {
+            if (_racks.emplace(location.rack).second) {
                 // New rack.
                 --_rf_left;
                 auto added = _endpoints.insert(ep).second;
@@ -155,7 +175,6 @@ class natural_endpoints_tracker {
 
     const token_metadata& _tm;
     const topology& _tp;
-    std::unordered_map<sstring, size_t> _dc_rep_factor;
 
     //
     // We want to preserve insertion order so that the first added endpoint
@@ -163,57 +182,58 @@ class natural_endpoints_tracker {
     //
     host_id_set _replicas;
     // tracks the racks we have already placed replicas in
-    endpoint_dc_rack_set _seen_racks;
+    rack_set _seen_racks;
 
-    //
-    // all endpoints in each DC, so we can check when we have exhausted all
-    // the members of a DC
-    //
-    std::unordered_map<sstring, std::unordered_set<inet_address>> _all_endpoints;
-
-    //
-    // all racks in a DC so we can check when we have exhausted all racks in a
-    // DC
-    //
-    std::unordered_map<sstring, std::unordered_map<sstring, std::unordered_set<inet_address>>> _racks;
-
-    std::unordered_map<sstring_view, data_center_endpoints> _dcs;
+    std::unordered_map<const datacenter*, data_center_endpoints> _dcs;
 
     size_t _dcs_to_fill;
 
 public:
-    natural_endpoints_tracker(const token_metadata& tm, const std::unordered_map<sstring, size_t>& dc_rep_factor)
+    natural_endpoints_tracker(const token_metadata& tm, const network_topology_strategy::dc_rep_factor& dc_rep_factor)
         : _tm(tm)
         , _tp(_tm.get_topology())
-        , _dc_rep_factor(dc_rep_factor)
-        , _all_endpoints(_tp.get_datacenter_endpoints())
-        , _racks(_tp.get_datacenter_racks())
     {
-        // not aware of any cluster members
-        assert(!_all_endpoints.empty() && !_racks.empty());
-
-        auto size_for = [](auto& map, auto& k) {
-            auto i = map.find(k);
-            return i != map.end() ? i->second.size() : size_t(0);
-        };
-
-        // Create a data_center_endpoints object for each non-empty DC.
-        for (auto& p : _dc_rep_factor) {
-            auto& dc = p.first;
-            auto rf = p.second;
-            auto node_count = size_for(_all_endpoints, dc);
-
-            if (rf == 0 || node_count == 0) {
+        std::unordered_set<const datacenter*> processed_dcs; // Used for tracking found datacenters in log_level::debug
+        for (const auto& [dc, dc_inventory] : _tp.get_inventory()) {
+            auto it = dc_rep_factor.find(dc);
+            if (it == dc_rep_factor.end()) {
+                continue;
+            }
+            if (rslogger.is_enabled(log_level::debug)) {
+                processed_dcs.insert(it->first);
+            }
+            auto rf = it->second;
+            if (!rf) {
                 continue;
             }
 
-            _dcs.emplace(dc, data_center_endpoints(rf, size_for(_racks, dc), node_count, _replicas, _seen_racks));
+            size_t node_count = dc_inventory.node_count;
+            size_t rack_count = dc_inventory.racks.size();
+            if (!node_count) {
+                rslogger.debug("datacenter {} with rf={} is empty", dc->name, rf);
+                continue;
+            }
+
+            // Create a data_center_endpoints object for each non-empty DC.
+            _dcs.emplace(dc, data_center_endpoints(rf, rack_count, node_count, _replicas, _seen_racks));
             _dcs_to_fill = _dcs.size();
+        }
+
+        if (rslogger.is_enabled(log_level::debug)) {
+            for (const auto& [dc, rf] : dc_rep_factor) {
+                if (!processed_dcs.contains(dc)) {
+                    rslogger.debug("datacenter {} with rf={} not found", dc->name, rf);
+                }
+            }
         }
     }
 
     bool add_endpoint_and_check_if_done(host_id ep) {
-        auto& loc = _tp.get_location(ep);
+        const auto* node = _tp.find_node(ep);
+        if (!node) {
+            on_internal_error(rslogger, format("Node {} not found", ep));
+        }
+        const auto& loc = node->location();
         auto i = _dcs.find(loc.dc);
         if (i != _dcs.end() && i->second.add_endpoint_and_check_if_done(ep, loc)) {
             --_dcs_to_fill;
@@ -229,15 +249,11 @@ public:
         return _replicas;
     }
 
-    static void check_enough_endpoints(const token_metadata& tm, const std::unordered_map<sstring, size_t>& dc_rf) {
-        const auto& dc_endpoints = tm.get_topology().get_datacenter_endpoints();
-        auto endpoints_in = [&dc_endpoints](sstring dc) {
-            auto i = dc_endpoints.find(dc);
-            return i != dc_endpoints.end() ? i->second.size() : size_t(0);
-        };
+    static void check_enough_endpoints(const token_metadata& tm, const network_topology_strategy::dc_rep_factor& dc_rf) {
+        const auto& topology = tm.get_topology();
         for (const auto& p : dc_rf) {
-            if (p.second > endpoints_in(p.first)) {
-                throw exceptions::configuration_exception(fmt::format("Datacenter {} doesn't have enough nodes for replication_factor={}", p.first, p.second));
+            if (p.second > topology.node_count(p.first)) {
+                throw exceptions::configuration_exception(fmt::format("Datacenter {} doesn't have enough nodes for replication_factor={}", p.first->name, p.second));
             }
         }
     }
@@ -282,9 +298,14 @@ void network_topology_strategy::validate_options(const gms::feature_service& fs)
 
 std::optional<std::unordered_set<sstring>> network_topology_strategy::recognized_options(const topology& topology) const {
     // We only allow datacenter names as options
-    auto opts = topology.get_datacenters();
+    auto opts = topology.get_datacenter_names();
     opts.merge(recognized_tablet_options());
     return opts;
+}
+
+size_t network_topology_strategy::get_replication_factor(const sstring& dc_name) const {
+    const auto* dc = _topology_registry.find_datacenter(dc_name);
+    return dc ? get_replication_factor(dc) : 0;
 }
 
 effective_replication_map_ptr network_topology_strategy::make_replication_map(table_id table, token_metadata_ptr tm) const {
@@ -301,20 +322,17 @@ effective_replication_map_ptr network_topology_strategy::make_replication_map(ta
 //    initial_tablets = max(nr_shards_in(dc) / RF_in(dc) for dc in datacenters)
 //
 
-static unsigned calculate_initial_tablets_from_topology(const schema& s, const topology& topo, const std::unordered_map<sstring, size_t>& rf) {
+static unsigned calculate_initial_tablets_from_topology(const schema& s, const topology& topo, const network_topology_strategy::dc_rep_factor& rf) {
     unsigned initial_tablets = std::numeric_limits<unsigned>::min();
-    for (const auto& dc : topo.get_datacenter_endpoints()) {
+    for (const auto& [dc, dc_inventory] : topo.get_inventory()) {
         unsigned shards_in_dc = 0;
         unsigned rf_in_dc = 1;
 
-        for (const auto& ep : dc.second) {
-            const auto* node = topo.find_node(ep);
-            if (node != nullptr) {
-                shards_in_dc += node->get_shard_count();
-            }
+        for (const auto& node : dc_inventory.nodes) {
+            shards_in_dc += node.get_shard_count();
         }
 
-        if (auto it = rf.find(dc.first); it != rf.end()) {
+        if (auto it = rf.find(dc); it != rf.end()) {
             rf_in_dc = it->second;
         }
 
@@ -374,7 +392,12 @@ future<tablet_map> network_topology_strategy::allocate_tablets_for_new_table(sch
     co_return tablets;
 }
 
-using registry = class_registrator<abstract_replication_strategy, network_topology_strategy, replication_strategy_params>;
+using registry = strategy_class_registry::registrator<network_topology_strategy>;
 static registry registrator("org.apache.cassandra.locator.NetworkTopologyStrategy");
 static registry registrator_short_name("NetworkTopologyStrategy");
+
+using traits_registry = strategy_class_traits_registry::registrator<network_topology_strategy_traits>;
+static traits_registry traits_registrator("org.apache.cassandra.locator.NetworkTopologyStrategy");
+static traits_registry traits_registrator_short_name("NetworkTopologyStrategy");
+
 }

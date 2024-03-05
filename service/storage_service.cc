@@ -607,8 +607,9 @@ future<> storage_service::topology_state_load() {
 
     {
         auto tmlock = co_await get_token_metadata_lock();
-        auto tmptr = make_token_metadata_ptr(token_metadata::config {
-            get_token_metadata().get_topology().get_config()
+        const auto& topology = get_token_metadata().get_topology();
+        auto tmptr = make_token_metadata_ptr(std::ref(topology.get_topology_registry()), token_metadata::config {
+            topology.get_config()
         });
         tmptr->invalidate_cached_rings();
 
@@ -3107,35 +3108,29 @@ future<std::map<gms::inet_address, float>> storage_service::effective_ownership(
         // The call for get_range_for_endpoint is done once per endpoint
         const auto& tm = *erm->get_token_metadata_ptr();
         const auto token_ownership = dht::token::describe_ownership(tm.sorted_tokens());
-        const auto datacenter_endpoints = tm.get_topology().get_datacenter_endpoints();
         std::map<gms::inet_address, float> final_ownership;
 
-        for (const auto& [dc, endpoints_map] : datacenter_endpoints) {
-            for (auto endpoint : endpoints_map) {
+        for (const auto& [dc, dc_inventory] : tm.get_topology().get_inventory()) {
+            for (const auto& node : dc_inventory.nodes) {
                 // calculate the ownership with replication and add the endpoint to the final ownership map
-                try {
-                    float ownership = 0.0f;
-                    auto ranges = ss.get_ranges_for_endpoint(erm, endpoint);
-                    for (auto& r : ranges) {
-                        // get_ranges_for_endpoint will unwrap the first range.
-                        // With t0 t1 t2 t3, the first range (t3,t0] will be split
-                        // as (min,t0] and (t3,max]. Skippping the range (t3,max]
-                        // we will get the correct ownership number as if the first
-                        // range were not split.
-                        if (!r.end()) {
-                            continue;
-                        }
-                        auto end_token = r.end()->value();
-                        auto loc = token_ownership.find(end_token);
-                        if (loc != token_ownership.end()) {
-                            ownership += loc->second;
-                        }
+                float ownership = 0.0f;
+                auto ranges = erm->get_ranges(&node);
+                for (auto& r : ranges) {
+                    // get_ranges will unwrap the first range.
+                    // With t0 t1 t2 t3, the first range (t3,t0] will be split
+                    // as (min,t0] and (t3,max]. Skippping the range (t3,max]
+                    // we will get the correct ownership number as if the first
+                    // range were not split.
+                    if (!r.end()) {
+                        continue;
                     }
-                    final_ownership[endpoint] = ownership;
-                }  catch (replica::no_such_keyspace&) {
-                    // In case ss.get_ranges_for_endpoint(keyspace_name, endpoint) is not found, just mark it as zero and continue
-                    final_ownership[endpoint] = 0;
+                    auto end_token = r.end()->value();
+                    auto loc = token_ownership.find(end_token);
+                    if (loc != token_ownership.end()) {
+                        ownership += loc->second;
+                    }
                 }
+                final_ownership[node.endpoint()] = ownership;
             }
         }
         co_return final_ownership;
@@ -4410,7 +4405,7 @@ future<> storage_service::rebuild(sstring source_dc) {
                 }
                 auto ks_erms = ss._db.local().get_non_local_strategy_keyspaces_erms();
                 for (const auto& [keyspace_name, erm] : ks_erms) {
-                    co_await streamer->add_ranges(keyspace_name, erm, ss.get_ranges_for_endpoint(erm, ss.get_broadcast_address()), ss._gossiper, false);
+                    co_await streamer->add_ranges(keyspace_name, erm, erm->get_ranges(), ss._gossiper, false);
                 }
                 try {
                     co_await streamer->stream_async();
@@ -4452,7 +4447,8 @@ int32_t storage_service::get_exception_count() {
 future<std::unordered_multimap<dht::token_range, inet_address>>
 storage_service::get_changed_ranges_for_leaving(locator::vnode_effective_replication_map_ptr erm, inet_address endpoint) {
     // First get all ranges the leaving endpoint is responsible for
-    auto ranges = get_ranges_for_endpoint(erm, endpoint);
+    const auto* node = erm->get_topology().find_node(endpoint);
+    auto ranges = erm->get_ranges(node);
 
     slogger.debug("Node {} ranges [{}]", endpoint, ranges);
 
@@ -4776,8 +4772,8 @@ storage_service::describe_ring_for_table(const sstring& keyspace_name, const sst
             dht::endpoint_details details;
             auto& hostid = r.host;
             auto endpoint = host2ip(hostid);
-            details._datacenter = topology.get_datacenter(hostid);
-            details._rack = topology.get_rack(hostid);
+            details._datacenter = topology.get_datacenter(hostid)->name;
+            details._rack = topology.get_rack(hostid)->name;
             details._host = endpoint;
             tr._rpc_endpoints.push_back(_gossiper.get_rpc_address(endpoint));
             tr._endpoints.push_back(fmt::to_string(details._host));
@@ -5259,7 +5255,7 @@ future<raft_topology_cmd_result> storage_service::raft_topology_cmd_handler(raft
                                 }
                                 auto ks_erms = _db.local().get_non_local_strategy_keyspaces_erms();
                                 for (const auto& [keyspace_name, erm] : ks_erms) {
-                                    co_await streamer->add_ranges(keyspace_name, erm, get_ranges_for_endpoint(erm, get_broadcast_address()), _gossiper, false);
+                                    co_await streamer->add_ranges(keyspace_name, erm, erm->get_ranges(), _gossiper, false);
                                 }
                                 try {
                                     co_await streamer->stream_async();
@@ -5541,8 +5537,8 @@ future<> storage_service::cleanup_tablet(locator::global_tablet_id tablet) {
     });
 }
 
-static bool increases_replicas_per_rack(const locator::topology& topology, const locator::tablet_info& tinfo, sstring dst_rack) {
-    std::unordered_map<sstring, size_t> m;
+static bool increases_replicas_per_rack(const locator::topology& topology, const locator::tablet_info& tinfo, const locator::rack* dst_rack) {
+    std::unordered_map<const locator::rack*, size_t> m;
     for (auto& replica: tinfo.replicas) {
         m[topology.get_rack(replica.host)]++;
     }
@@ -5610,16 +5606,16 @@ future<> storage_service::move_tablet(table_id table, dht::token token, locator:
         auto dst_dc_rack = get_token_metadata().get_topology().get_location(dst.host);
         if (src_dc_rack.dc != dst_dc_rack.dc) {
             if (force) {
-                slogger.warn("Moving tablet {} between DCs ({} and {})", gid, src_dc_rack.dc, dst_dc_rack.dc);
+                slogger.warn("Moving tablet {} between DCs ({} and {})", gid, src_dc_rack.dc->name, dst_dc_rack.dc->name);
             } else {
-                throw std::runtime_error(fmt::format("Attempted to move tablet {} between DCs ({} and {})", gid, src_dc_rack.dc, dst_dc_rack.dc));
+                throw std::runtime_error(fmt::format("Attempted to move tablet {} between DCs ({} and {})", gid, src_dc_rack.dc->name, dst_dc_rack.dc->name));
             }
         }
         if (src_dc_rack.rack != dst_dc_rack.rack && increases_replicas_per_rack(get_token_metadata().get_topology(), tinfo, dst_dc_rack.rack)) {
             if (force) {
-                slogger.warn("Moving tablet {} between racks ({} and {}) which reduces availability", gid, src_dc_rack.rack, dst_dc_rack.rack);
+                slogger.warn("Moving tablet {} between racks ({} and {}) which reduces availability", gid, src_dc_rack.rack->name, dst_dc_rack.rack->name);
             } else {
-                throw std::runtime_error(fmt::format("Attempted to move tablet {} between racks ({} and {}) which would reduce availability", gid, src_dc_rack.rack, dst_dc_rack.rack));
+                throw std::runtime_error(fmt::format("Attempted to move tablet {} between racks ({} and {}) which would reduce availability", gid, src_dc_rack.rack->name, dst_dc_rack.rack->name));
             }
         }
 
@@ -6364,11 +6360,6 @@ storage_service::get_splits(const sstring& ks_name, const sstring& cf_name, wrap
 
     return calculate_splits(std::move(tokens), split_count, cf);
 };
-
-dht::token_range_vector
-storage_service::get_ranges_for_endpoint(const locator::vnode_effective_replication_map_ptr& erm, const gms::inet_address& ep) const {
-    return erm->get_ranges(ep);
-}
 
 // Caller is responsible to hold token_metadata valid until the returned future is resolved
 future<dht::token_range_vector>

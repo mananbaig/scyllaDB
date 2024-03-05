@@ -1223,20 +1223,20 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
         // when "primary_range" option is on, neither data_centers nor hosts
         // may be set, except data_centers may contain only local DC (-local)
         if (options.data_centers.size() == 1 &&
-            options.data_centers[0] == topology.get_datacenter()) {
+            options.data_centers[0] == topology.get_datacenter()->name) {
             // get_primary_ranges_within_dc() is similar to get_primary_ranges(),
             // but instead of each range being assigned just one primary owner
             // across the entire cluster, here each range is assigned a primary
             // owner in each of the DCs.
-            ranges = erm.get_primary_ranges_within_dc(my_address);
+            ranges = erm.get_primary_ranges_within_dc();
         } else if (options.data_centers.size() > 0 || options.hosts.size() > 0) {
             throw std::runtime_error("You need to run primary range repair on all nodes in the cluster.");
         } else {
-            ranges = erm.get_primary_ranges(my_address);
+            ranges = erm.get_primary_ranges();
         }
     } else {
         // get keyspace local ranges
-        ranges = erm.get_ranges(my_address);
+        ranges = erm.get_ranges();
     }
 
     if (!options.data_centers.empty() && !options.hosts.empty()) {
@@ -1549,8 +1549,9 @@ future<> repair_service::bootstrap_with_repair(locator::token_metadata_ptr tmptr
         auto& db = get_db().local();
         auto ks_erms = db.get_non_local_strategy_keyspaces_erms();
         auto& topology = tmptr->get_topology();
-        auto myloc = topology.get_location();
-        auto myid = tmptr->get_my_id();
+        const auto* mynode = topology.this_node();
+        auto myloc = mynode->location();
+        auto myid = mynode->host_id();
         auto reason = streaming::stream_reason::bootstrap;
         // Calculate number of ranges to sync data
         size_t nr_ranges_total = 0;
@@ -1559,7 +1560,7 @@ future<> repair_service::bootstrap_with_repair(locator::token_metadata_ptr tmptr
                 continue;
             }
             auto& strat = erm->get_replication_strategy();
-            dht::token_range_vector desired_ranges = strat.get_pending_address_ranges(tmptr, tokens, myid, myloc).get();
+            dht::token_range_vector desired_ranges = strat.get_pending_address_ranges(tmptr, tokens, myid, myloc.get_dc_rack()).get();
             seastar::thread::maybe_yield();
             auto nr_tables = get_nr_tables(db, keyspace_name);
             nr_ranges_total += desired_ranges.size() * nr_tables;
@@ -1575,7 +1576,7 @@ future<> repair_service::bootstrap_with_repair(locator::token_metadata_ptr tmptr
                 continue;
             }
             auto& strat = erm->get_replication_strategy();
-            dht::token_range_vector desired_ranges = strat.get_pending_address_ranges(tmptr, tokens, myid, myloc).get();
+            dht::token_range_vector desired_ranges = strat.get_pending_address_ranges(tmptr, tokens, myid, myloc.get_dc_rack()).get();
             bool find_node_in_local_dc_only = strat.get_type() == locator::replication_strategy_type::network_topology;
             bool everywhere_topology = strat.get_type() == locator::replication_strategy_type::everywhere_topology;
             auto replication_factor = erm->get_replication_factor();
@@ -1585,7 +1586,7 @@ future<> repair_service::bootstrap_with_repair(locator::token_metadata_ptr tmptr
             auto range_addresses = strat.get_range_addresses(metadata_clone).get();
 
             //Pending ranges
-            metadata_clone.update_topology(myid, myloc, locator::node::state::bootstrapping);
+            metadata_clone.update_topology(myid, myloc.get_dc_rack(), locator::node::state::bootstrapping);
             metadata_clone.update_normal_tokens(tokens, myid).get();
             auto pending_range_addresses = strat.get_range_addresses(metadata_clone).get();
             metadata_clone.clear_gently().get();
@@ -1719,17 +1720,18 @@ future<> repair_service::bootstrap_with_repair(locator::token_metadata_ptr tmptr
     });
 }
 
-future<> repair_service::do_decommission_removenode_with_repair(locator::token_metadata_ptr tmptr, gms::inet_address leaving_node, shared_ptr<node_ops_info> ops) {
+future<> repair_service::do_decommission_removenode_with_repair(locator::token_metadata_ptr tmptr, gms::inet_address leaving_node_addr, shared_ptr<node_ops_info> ops) {
     assert(this_shard_id() == 0);
     using inet_address = gms::inet_address;
-    return seastar::async([this, tmptr = std::move(tmptr), leaving_node = std::move(leaving_node), ops] () mutable {
+    return seastar::async([this, tmptr = std::move(tmptr), leaving_node_addr = std::move(leaving_node_addr), ops] () mutable {
         auto& db = get_db().local();
         auto& topology = tmptr->get_topology();
         auto myip = topology.my_address();
-        const auto leaving_node_id = tmptr->get_host_id(leaving_node);
+        const auto* leaving_node = topology.find_node(leaving_node_addr);
+        const auto leaving_node_id = leaving_node->host_id();
         auto ks_erms = db.get_non_local_strategy_keyspaces_erms();
         auto local_dc = topology.get_datacenter();
-        bool is_removenode = myip != leaving_node;
+        bool is_removenode = topology.this_node() != leaving_node;
         auto op = is_removenode ? "removenode_with_repair" : "decommission_with_repair";
         streaming::stream_reason reason = is_removenode ? streaming::stream_reason::removenode : streaming::stream_reason::decommission;
         size_t nr_ranges_total = 0;
@@ -1753,7 +1755,7 @@ future<> repair_service::do_decommission_removenode_with_repair(locator::token_m
             static std::list<gms::inet_address> no_ignore_nodes;
             return ops ? ops->ignore_nodes : no_ignore_nodes;
         };
-        rlogger.info("{}: started with keyspaces={}, leaving_node={}, ignore_nodes={}", op, ks_erms | boost::adaptors::map_keys, leaving_node, get_ignore_nodes());
+        rlogger.info("{}: started with keyspaces={}, leaving_node={}, ignore_nodes={}", op, ks_erms | boost::adaptors::map_keys, *leaving_node, get_ignore_nodes());
         for (const auto& [keyspace_name, erm] : ks_erms) {
             if (!db.has_keyspace(keyspace_name)) {
                 rlogger.info("{}: keyspace={} does not exist any more, ignoring it", op, keyspace_name);
@@ -1763,7 +1765,7 @@ future<> repair_service::do_decommission_removenode_with_repair(locator::token_m
             // First get all ranges the leaving node is responsible for
             dht::token_range_vector ranges = erm->get_ranges(leaving_node);
             auto nr_tables = get_nr_tables(db, keyspace_name);
-            rlogger.info("{}: started with keyspace={}, leaving_node={}, nr_ranges={}", op, keyspace_name, leaving_node, ranges.size() * nr_tables);
+            rlogger.info("{}: started with keyspace={}, leaving_node={}, nr_ranges={}", op, keyspace_name, *leaving_node, ranges.size() * nr_tables);
             size_t nr_ranges_total = ranges.size() * nr_tables;
             size_t nr_ranges_skipped = 0;
             std::unordered_map<dht::token_range, locator::endpoint_set> current_replica_endpoints;
@@ -1809,7 +1811,7 @@ future<> repair_service::do_decommission_removenode_with_repair(locator::token_m
                     }
                     if (find_node_in_local_dc_only) {
                         throw std::runtime_error(format("{}: keyspace={}, range={}, current_replica_endpoints={}, new_replica_endpoints={}, can not find new node in local dc={}",
-                                op, keyspace_name, r, current_eps, new_eps, local_dc));
+                                op, keyspace_name, r, current_eps, new_eps, local_dc->name));
                     } else {
                         return std::unordered_set<inet_address>{nodes.front()};
                     }
@@ -1868,7 +1870,7 @@ future<> repair_service::do_decommission_removenode_with_repair(locator::token_m
                             op, keyspace_name, r, current_eps, new_eps, new_owner));
                 }
                 neighbors_set.erase(myip);
-                neighbors_set.erase(leaving_node);
+                neighbors_set.erase(leaving_node_addr);
                 // Remove nodes in ignore_nodes
                 for (const auto& node : get_ignore_nodes()) {
                     neighbors_set.erase(node);
@@ -1909,9 +1911,9 @@ future<> repair_service::do_decommission_removenode_with_repair(locator::token_m
             auto nr_ranges_synced = ranges.size();
             sync_data_using_repair(keyspace_name, erm, std::move(ranges), std::move(range_sources), reason, ops).get();
             rlogger.info("{}: finished with keyspace={}, leaving_node={}, nr_ranges={}, nr_ranges_synced={}, nr_ranges_skipped={}",
-                op, keyspace_name, leaving_node, nr_ranges_total, nr_ranges_synced, nr_ranges_skipped);
+                op, keyspace_name, *leaving_node, nr_ranges_total, nr_ranges_synced, nr_ranges_skipped);
         }
-        rlogger.info("{}: finished with keyspaces={}, leaving_node={}", op, ks_erms | boost::adaptors::map_keys, leaving_node);
+        rlogger.info("{}: finished with keyspaces={}, leaving_node={}", op, ks_erms | boost::adaptors::map_keys, *leaving_node);
     });
 }
 
@@ -1977,19 +1979,20 @@ future<> repair_service::do_rebuild_replace_with_repair(locator::token_metadata_
             std::unordered_map<dht::token_range, repair_neighbors> range_sources;
             auto nr_tables = get_nr_tables(db, keyspace_name);
             rlogger.info("{}: started with keyspace={}, source_dc={}, nr_ranges={}, ignore_nodes={}", op, keyspace_name, source_dc, ranges.size() * nr_tables, ignore_nodes);
+            const auto* source_dc_ptr = source_dc.empty() ? nullptr : topology.find_datacenter(source_dc);
             for (auto it = ranges.begin(); it != ranges.end();) {
                 auto& r = *it;
                 seastar::thread::maybe_yield();
                 auto end_token = r.end() ? r.end()->value() : dht::maximum_token();
                 auto neighbors = boost::copy_range<std::vector<gms::inet_address>>(strat.calculate_natural_ips(end_token, *tmptr).get() |
-                    boost::adaptors::filtered([myip, &source_dc, &topology, &ignore_nodes] (const gms::inet_address& node) {
+                    boost::adaptors::filtered([myip, source_dc_ptr, &topology, &ignore_nodes] (const gms::inet_address& node) {
                         if (node == myip) {
                             return false;
                         }
                         if (ignore_nodes.contains(node)) {
                             return false;
                         }
-                        return source_dc.empty() ? true : topology.get_datacenter(node) == source_dc;
+                        return !source_dc_ptr || topology.get_datacenter(node) == source_dc_ptr;
                     })
                 );
                 rlogger.debug("{}: keyspace={}, range={}, neighbors={}", op, keyspace_name, r, neighbors);
@@ -2024,7 +2027,7 @@ future<> repair_service::rebuild_with_repair(locator::token_metadata_ptr tmptr, 
     auto op = sstring("rebuild_with_repair");
     if (source_dc.empty()) {
         auto& topology = tmptr->get_topology();
-        source_dc = topology.get_datacenter();
+        source_dc = topology.get_datacenter()->name;
     }
     auto reason = streaming::stream_reason::rebuild;
     co_await do_rebuild_replace_with_repair(std::move(tmptr), std::move(op), std::move(source_dc), reason, {});
@@ -2045,9 +2048,9 @@ future<> repair_service::replace_with_repair(locator::token_metadata_ptr tmptr, 
     // update a cloned version of tmptr
     // no need to set the original version
     auto cloned_tmptr = make_token_metadata_ptr(std::move(cloned_tm));
-    cloned_tmptr->update_topology(tmptr->get_my_id(), myloc, locator::node::state::replacing);
+    cloned_tmptr->update_topology(tmptr->get_my_id(), myloc.get_dc_rack(), locator::node::state::replacing);
     co_await cloned_tmptr->update_normal_tokens(replacing_tokens, tmptr->get_my_id());
-    co_return co_await do_rebuild_replace_with_repair(std::move(cloned_tmptr), std::move(op), myloc.dc, reason, std::move(ignore_nodes));
+    co_return co_await do_rebuild_replace_with_repair(std::move(cloned_tmptr), std::move(op), myloc.dc->name, reason, std::move(ignore_nodes));
 }
 
 // Repair all tablets belong to this node for the given table

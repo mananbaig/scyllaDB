@@ -15,8 +15,12 @@
 
 namespace locator {
 
-everywhere_replication_strategy::everywhere_replication_strategy(replication_strategy_params params) :
-        abstract_replication_strategy(params, replication_strategy_type::everywhere_topology) {
+everywhere_replication_strategy_traits::everywhere_replication_strategy_traits(const replication_strategy_params&)
+    : abstract_replication_strategy_traits(replication_strategy_type::everywhere_topology)
+{}
+
+everywhere_replication_strategy::everywhere_replication_strategy(const topology&, replication_strategy_params params) :
+        abstract_replication_strategy(everywhere_replication_strategy_traits(params), params) {
     _natural_endpoints_depend_on_token = false;
 }
 
@@ -33,7 +37,12 @@ size_t everywhere_replication_strategy::get_replication_factor(const token_metad
     return tm.sorted_tokens().empty() ? 1 : tm.count_normal_token_owners();
 }
 
-using registry = class_registrator<abstract_replication_strategy, everywhere_replication_strategy, replication_strategy_params>;
+using registry = strategy_class_registry::registrator<everywhere_replication_strategy>;
 static registry registrator("org.apache.cassandra.locator.EverywhereStrategy");
 static registry registrator_short_name("EverywhereStrategy");
+
+using traits_registry = strategy_class_traits_registry::registrator<everywhere_replication_strategy_traits>;
+static traits_registry traits_registrator("org.apache.cassandra.locator.EverywhereStrategy");
+static traits_registry traits_registrator_short_name("EverywhereStrategy");
+
 }

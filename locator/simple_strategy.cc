@@ -16,8 +16,12 @@
 
 namespace locator {
 
-simple_strategy::simple_strategy(replication_strategy_params params) :
-        abstract_replication_strategy(params, replication_strategy_type::simple) {
+simple_strategy_traits::simple_strategy_traits(const replication_strategy_params&)
+    : abstract_replication_strategy_traits(replication_strategy_type::simple)
+{}
+
+simple_strategy::simple_strategy(const topology&, replication_strategy_params params) :
+        abstract_replication_strategy(simple_strategy_traits(params), params) {
     for (auto& config_pair : _config_options) {
         auto& key = config_pair.first;
         auto& val = config_pair.second;
@@ -75,8 +79,12 @@ std::optional<std::unordered_set<sstring>>simple_strategy::recognized_options(co
     return {{ "replication_factor" }};
 }
 
-using registry = class_registrator<abstract_replication_strategy, simple_strategy, replication_strategy_params>;
+using registry = strategy_class_registry::registrator<simple_strategy>;
 static registry registrator("org.apache.cassandra.locator.SimpleStrategy");
 static registry registrator_short_name("SimpleStrategy");
+
+using traits_registry = strategy_class_traits_registry::registrator<simple_strategy_traits>;
+static traits_registry traits_registrator("org.apache.cassandra.locator.SimpleStrategy");
+static traits_registry traits_registrator_short_name("SimpleStrategy");
 
 }

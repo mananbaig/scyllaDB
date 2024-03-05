@@ -13,8 +13,12 @@
 
 namespace locator {
 
-local_strategy::local_strategy(replication_strategy_params params) :
-        abstract_replication_strategy(params, replication_strategy_type::local) {
+local_strategy_traits::local_strategy_traits(const replication_strategy_params&)
+    : abstract_replication_strategy_traits(replication_strategy_type::local, local::yes)
+{}
+
+local_strategy::local_strategy(const topology&, replication_strategy_params params) :
+        abstract_replication_strategy(local_strategy_traits(params), params) {
     _natural_endpoints_depend_on_token = false;
 }
 
@@ -34,8 +38,12 @@ size_t local_strategy::get_replication_factor(const token_metadata&) const {
     return 1;
 }
 
-using registry = class_registrator<abstract_replication_strategy, local_strategy, replication_strategy_params>;
+using registry = strategy_class_registry::registrator<local_strategy>;
 static registry registrator("org.apache.cassandra.locator.LocalStrategy");
 static registry registrator_short_name("LocalStrategy");
+
+using traits_registry = strategy_class_traits_registry::registrator<local_strategy_traits>;
+static traits_registry traits_registrator("org.apache.cassandra.locator.LocalStrategy");
+static traits_registry traits_registrator_short_name("LocalStrategy");
 
 }

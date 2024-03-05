@@ -32,7 +32,7 @@ size_t quorum_for(const locator::effective_replication_map& erm) {
     return replication_factor ? (replication_factor / 2) + 1 : 0;
 }
 
-size_t local_quorum_for(const locator::effective_replication_map& erm, const sstring& dc) {
+size_t local_quorum_for(const locator::effective_replication_map& erm, const locator::datacenter* dc) {
     using namespace locator;
 
     auto& rs = erm.get_replication_strategy();
@@ -58,7 +58,8 @@ size_t block_for_local_serial(const locator::effective_replication_map& erm) {
     //
 
     const auto& topo = erm.get_topology();
-    return local_quorum_for(erm, topo.get_datacenter());
+    const auto* local_dc = topo.this_node()->dc();
+    return local_quorum_for(erm, local_dc);
 }
 
 size_t block_for_each_quorum(const locator::effective_replication_map& erm) {
@@ -71,7 +72,7 @@ size_t block_for_each_quorum(const locator::effective_replication_map& erm) {
             static_cast<const network_topology_strategy*>(&rs);
         size_t n = 0;
 
-        for (auto& dc : nrs->get_datacenters()) {
+        for (const auto& [dc, rf] : nrs->get_dc_rep_factor()) {
             n += local_quorum_for(erm, dc);
         }
 
@@ -115,7 +116,7 @@ bool is_datacenter_local(consistency_level l) {
 }
 
 template <typename Range, typename PendingRange = std::array<gms::inet_address, 0>>
-std::unordered_map<sstring, dc_node_count> count_per_dc_endpoints(
+std::unordered_map<const locator::datacenter*, dc_node_count> count_per_dc_endpoints(
         const locator::effective_replication_map& erm,
         const Range& live_endpoints,
         const PendingRange& pending_endpoints = std::array<gms::inet_address, 0>()) {
@@ -127,23 +128,25 @@ std::unordered_map<sstring, dc_node_count> count_per_dc_endpoints(
     const network_topology_strategy* nrs =
             static_cast<const network_topology_strategy*>(&rs);
 
-    std::unordered_map<sstring, dc_node_count> dc_endpoints;
-    for (auto& dc : nrs->get_datacenters()) {
+    std::unordered_map<const locator::datacenter*, dc_node_count> dc_endpoints;
+    for (const auto& [dc, rf] : nrs->get_dc_rep_factor()) {
         dc_endpoints.emplace(dc, dc_node_count());
     }
 
     //
     // Since live_endpoints are a subset of a get_natural_endpoints() output we
     // will never get any endpoints outside the dataceters from
-    // nrs->get_datacenters().
+    // nrs->get_dc_rep_factor().
     //
 
     for (auto& endpoint : live_endpoints) {
-        ++(dc_endpoints[topo.get_datacenter(endpoint)].live);
+        const auto* dc = topo.find_node(endpoint)->dc();
+        ++(dc_endpoints[dc].live);
     }
 
     for (auto& endpoint : pending_endpoints) {
-        ++(dc_endpoints[topo.get_datacenter(endpoint)].pending);
+        const auto* dc = topo.find_node(endpoint)->dc();
+        ++(dc_endpoints[dc].pending);
     }
 
     return dc_endpoints;
