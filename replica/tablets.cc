@@ -73,9 +73,9 @@ std::vector<data_value> replicas_to_data_value(const tablet_replica_set& replica
     return result;
 };
 
-future<mutation>
-tablet_map_to_mutation(const tablet_map& tablets, table_id id, const sstring& keyspace_name, const sstring& table_name,
-                       api::timestamp_type ts) {
+future<>
+tablet_map_to_mutations(const tablet_map& tablets, table_id id, const sstring& keyspace_name, const sstring& table_name,
+                       api::timestamp_type ts, std::function<future<>(mutation)> process_mutation) {
     auto s = db::system_keyspace::tablets();
     auto gc_now = gc_clock::now();
     auto tombstone_ts = ts - 1;
@@ -106,7 +106,7 @@ tablet_map_to_mutation(const tablet_map& tablets, table_id id, const sstring& ke
         tid = *tablets.next_tablet(tid);
         co_await coroutine::maybe_yield();
     }
-    co_return std::move(m);
+    co_await process_mutation(std::move(m));
 }
 
 tablet_mutation_builder&
@@ -194,15 +194,16 @@ tablet_replica_set deserialize_replica_set(cql3::untyped_result_set_row::view_ty
 
 future<> save_tablet_metadata(replica::database& db, const tablet_metadata& tm, api::timestamp_type ts) {
     tablet_logger.trace("Saving tablet metadata: {}", tm);
-    std::vector<mutation> muts;
+    std::vector<frozen_mutation> muts;
     muts.reserve(tm.all_tables().size());
     for (auto&& [id, tablets] : tm.all_tables()) {
         // FIXME: Should we ignore missing tables? Currently doesn't matter because this is only used in tests.
         auto s = db.find_schema(id);
-        muts.emplace_back(
-                co_await tablet_map_to_mutation(tablets, id, s->ks_name(), s->cf_name(), ts));
+        co_await tablet_map_to_mutations(tablets, id, s->ks_name(), s->cf_name(), ts, [&] (mutation m) -> future<> {
+            muts.emplace_back(co_await freeze_gently(m));
+        });
     }
-    co_await db.apply(freeze(muts), db::no_timeout);
+    co_await db.apply(muts, db::no_timeout);
 }
 
 future<tablet_metadata> read_tablet_metadata(cql3::query_processor& qp) {
