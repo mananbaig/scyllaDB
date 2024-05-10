@@ -26,6 +26,7 @@
 #include "db/config.hh"
 #include "db/system_auth_keyspace.hh"
 #include "utils/error_injection.hh"
+#include "mutation/async_utils.hh"
 
 namespace auth {
 
@@ -121,7 +122,7 @@ future<> create_legacy_metadata_table_if_missing(
 
 static future<> announce_mutations_with_guard(
         ::service::raft_group0_client& group0_client,
-        std::vector<canonical_mutation> muts,
+        canonical_mutation_vector muts,
         ::service::group0_guard group0_guard,
         seastar::abort_source* as,
         std::optional<::service::raft_timeout> timeout) {
@@ -149,7 +150,7 @@ future<> announce_mutations_with_batching(
     });
 
     size_t memory_usage = 0;
-    std::vector<canonical_mutation> muts;
+    canonical_mutation_vector muts;
 
     // guard has to be taken before we execute code in gen as
     // it can do read-before-write and we want announce_mutations
@@ -199,7 +200,7 @@ future<> announce_mutations(
             internal_distributed_query_state(),
             timestamp,
             std::move(values));
-    std::vector<canonical_mutation> cmuts = {muts.begin(), muts.end()};
+    auto cmuts = co_await make_canonical_mutations_gently(std::move(muts));
     co_await announce_mutations_with_guard(group0_client, std::move(cmuts), std::move(group0_guard), as, timeout);
 }
 

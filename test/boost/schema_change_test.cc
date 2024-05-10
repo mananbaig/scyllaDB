@@ -136,7 +136,7 @@ SEASTAR_TEST_CASE(test_tombstones_are_ignored_in_version_calculation) {
                 mutation m(s, pkey);
                 auto ckey = clustering_key::from_exploded(*s, {utf8_type->decompose(table_schema->cf_name()), "v1"});
                 m.partition().apply_delete(*s, ckey, tombstone(api::min_timestamp, gc_clock::now()));
-                mm.announce(std::vector<mutation>({m}), mm.start_group0_operation().get(), "").get();
+                mm.announce(mutation_vector({m}), mm.start_group0_operation().get(), "").get();
             }
 
             auto new_table_version = e.db().local().find_schema(table_schema->id())->version();
@@ -243,8 +243,8 @@ SEASTAR_TEST_CASE(test_sort_type_in_update) {
         auto muts2 = db::schema_tables::make_create_type_mutations(keyspace, type2, ts);
 
         auto muts = muts2;
-        muts.insert(muts.end(), muts1.begin(), muts1.end());
-        muts.insert(muts.end(), muts3.begin(), muts3.end());
+        std::move(muts1.begin(), muts1.end(), std::back_inserter(muts));
+        std::move(muts3.begin(), muts3.end(), std::back_inserter(muts));
         mm.announce(std::move(muts), std::move(group0_guard), "").get();
     });
 }
@@ -454,7 +454,7 @@ SEASTAR_TEST_CASE(test_merging_does_not_alter_tables_which_didnt_change) {
                 return e.db().local().find_column_family("ks", "table1");
             };
 
-            std::vector<mutation> muts1;
+            mutation_vector muts1;
             {
                 auto group0_guard = mm.start_group0_operation().get();
                 muts1 = db::schema_tables::make_create_table_mutations(s0, group0_guard.write_timestamp());
@@ -502,7 +502,7 @@ SEASTAR_TEST_CASE(test_merging_creates_a_table_even_if_keyspace_was_recreated) {
                 return e.db().local().find_column_family("ks", "table1");
             };
 
-            std::vector<mutation> all_muts;
+            mutation_vector all_muts;
 
             {
                 auto group0_guard = mm.start_group0_operation().get();
@@ -620,7 +620,7 @@ SEASTAR_TEST_CASE(test_nested_type_mutation_in_update) {
         auto muts2 = db::schema_tables::make_create_type_mutations(keyspace, type2, ts);
 
         auto muts = muts1;
-        muts.insert(muts.end(), muts2.begin(), muts2.end());
+        std::move(muts2.begin(), muts2.end(), std::back_inserter(muts));
         mm.announce(std::move(muts), std::move(group0_guard), "").get();
 
         BOOST_REQUIRE_EQUAL(listener.create_user_type_count, 2);

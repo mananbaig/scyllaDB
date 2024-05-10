@@ -75,7 +75,7 @@ group0_state_machine::group0_state_machine(raft_group0_client& client, migration
         })) {
 }
 
-static mutation extract_history_mutation(std::vector<canonical_mutation>& muts, const data_dictionary::database db) {
+static mutation extract_history_mutation(canonical_mutation_vector& muts, const data_dictionary::database db) {
     auto s = db.find_schema(db::system_keyspace::NAME, db::system_keyspace::GROUP0_HISTORY);
     auto it = std::find_if(muts.begin(), muts.end(), [history_table_id = s->id()]
             (canonical_mutation& m) { return m.column_family_id() == history_table_id; });
@@ -83,7 +83,12 @@ static mutation extract_history_mutation(std::vector<canonical_mutation>& muts, 
         on_internal_error(slogger, "group0 history table mutation not found");
     }
     auto res = it->to_mutation(s);
-    muts.erase(it);
+    canonical_mutation_vector remaining;
+    remaining.reserve(muts.size() - 1);
+    // chunked_vector doesn't support muts.erase(it)
+    std::move(muts.begin(), it, std::back_inserter(remaining));
+    std::move(++it, muts.end(), std::back_inserter(remaining));
+    muts = std::move(remaining);
     return res;
 }
 
@@ -116,7 +121,7 @@ static bool should_flush_system_topology_after_applying(const mutation& mut, con
     return false;
 }
 
-static future<> write_mutations_to_database(storage_proxy& proxy, gms::inet_address from, std::vector<canonical_mutation> cms) {
+static future<> write_mutations_to_database(storage_proxy& proxy, gms::inet_address from, canonical_mutation_vector cms) {
     std::vector<frozen_mutation_and_schema> mutations;
     mutations.reserve(cms.size());
     bool need_system_topology_flush = false;

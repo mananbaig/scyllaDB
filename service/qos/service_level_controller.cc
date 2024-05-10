@@ -23,6 +23,7 @@
 #include "db/system_distributed_keyspace.hh"
 #include "cql3/query_processor.hh"
 #include "service/storage_proxy.hh"
+#include "mutation/async_utils.hh"
 
 namespace qos {
 static logging::logger sl_logger("service_level_controller");
@@ -494,7 +495,7 @@ future<> service_level_controller::migrate_to_v2(size_t nodes_count, db::system_
     
     auto guard = co_await group0_client.start_operation(&as);
 
-    std::vector<mutation> migration_muts;
+    mutation_vector migration_muts;
     for (const auto& row: *rows) {
         std::vector<data_value_or_unset> values;
         for (const auto& col: schema->all_columns()) {
@@ -524,7 +525,7 @@ future<> service_level_controller::migrate_to_v2(size_t nodes_count, db::system_
     migration_muts.push_back(std::move(status_mut));
 
     service::write_mutations change {
-        .mutations{migration_muts.begin(), migration_muts.end()},
+        .mutations = co_await make_canonical_mutations_gently(std::move(migration_muts)),
     };
     auto group0_cmd = group0_client.prepare_command(change, guard, "migrate service levels to v2");
     co_await group0_client.add_entry(std::move(group0_cmd), std::move(guard), &as);

@@ -107,6 +107,16 @@ future<canonical_mutation> make_canonical_mutation_gently(const mutation& m)
     co_return res;
 }
 
+future<canonical_mutation_vector> make_canonical_mutations_gently(mutation_vector&& muts) {
+    canonical_mutation_vector res;
+    res.reserve(muts.size());
+    for (auto&& mut : muts) {
+        auto m = std::move(mut);
+        res.emplace_back(co_await make_canonical_mutation_gently(m));
+    }
+    co_return res;
+}
+
 future<frozen_mutation>
 freeze_gently(const mutation& m) {
     auto fm = frozen_mutation(m.key());
@@ -138,8 +148,8 @@ unfreeze_gently(const frozen_mutation& fm, schema_ptr schema) {
     co_return m;
 }
 
-future<std::vector<mutation>> unfreeze_gently(std::span<frozen_mutation> muts) {
-    std::vector<mutation> result;
+future<mutation_vector> unfreeze_gently(const frozen_mutation_vector& muts) {
+    mutation_vector result;
     result.reserve(muts.size());
     for (auto& fm : muts) {
         result.push_back(co_await unfreeze_gently(fm, local_schema_registry().get(fm.schema_version())));

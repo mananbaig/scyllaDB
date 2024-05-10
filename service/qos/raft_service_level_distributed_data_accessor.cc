@@ -13,6 +13,7 @@
 #include "service/raft/raft_group0_client.hh"
 #include "db/system_keyspace.hh"
 #include "types/types.hh"
+#include "mutation/async_utils.hh"
 
 namespace qos {
 
@@ -46,9 +47,9 @@ future<qos::service_levels_info> raft_service_level_distributed_data_accessor::g
     return qos::get_service_level(_qp, db::system_keyspace::NAME, db::system_keyspace::SERVICE_LEVELS_V2, std::move(service_level_name), db::consistency_level::LOCAL_ONE);
 }
 
-future<> raft_service_level_distributed_data_accessor::do_raft_command(service::group0_guard guard, abort_source& as, std::vector<mutation> mutations, std::string_view description) const {    
+future<> raft_service_level_distributed_data_accessor::do_raft_command(service::group0_guard guard, abort_source& as, mutation_vector mutations, std::string_view description) const {    
     service::write_mutations change {
-        .mutations{mutations.begin(), mutations.end()},
+        .mutations = co_await make_canonical_mutations_gently(std::move(mutations)),
     };
 
     auto group0_cmd = _group0_client.prepare_command(change, guard, description);
