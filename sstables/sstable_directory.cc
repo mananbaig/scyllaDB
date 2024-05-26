@@ -20,13 +20,21 @@
 #include "compaction/compaction_manager.hh"
 #include "log.hh"
 #include "sstable_directory.hh"
-#include "utils/lister.hh"
 #include "utils/overloaded_functor.hh"
 #include "utils/directories.hh"
 #include "replica/database.hh"
 #include "dht/auto_refreshing_sharder.hh"
+#include "checked-file-impl.hh"
 
 static logging::logger dirlog("sstable_directory");
+
+static inline fs::path operator/(const fs::path& lhs, const char* rhs) {
+    return lhs / fs::path(rhs);
+}
+
+static inline fs::path operator/(const fs::path& lhs, std::string_view rhs) {
+    return lhs / fs::path(rhs);
+}
 
 namespace sstables {
 
@@ -255,11 +263,27 @@ future<> sstable_directory::filesystem_components_lister::prepare(sstable_direct
     // as there could be a race with scylla-manager that might
     // delete snapshots concurrently
     co_await utils::directories::verify_owner_and_mode(_directory, utils::directories::recursive::no);
-    co_await lister::scan_dir(_directory, lister::dir_entry_types::of<directory_entry_type::directory>(), [] (fs::path dir, directory_entry de) -> future<> {
-        if (de.name != sstables::snapshots_dir) {
-            co_await utils::directories::verify_owner_and_mode(dir / de.name, utils::directories::recursive::yes);
+    auto d = co_await open_checked_directory(general_disk_error_handler, _directory.native());
+    auto lister = d.experimental_list_directory();
+
+    std::exception_ptr ex;
+    try {
+        while (auto de = co_await lister()) {
+            if (de->type != directory_entry_type::directory || de->name[0] == '.') {
+                continue;
+            }
+
+            if (de->name != sstables::snapshots_dir) {
+                co_await utils::directories::verify_owner_and_mode(_directory / de->name, utils::directories::recursive::yes);
+            }
         }
-    });
+    } catch (...) {
+        ex = std::current_exception();
+    }
+    co_await d.close();
+    if (ex) {
+        std::rethrow_exception(std::move(ex));
+    }
 
     if (flags.garbage_collect) {
         co_await garbage_collect(st);
@@ -296,14 +320,16 @@ future<> sstable_directory::filesystem_components_lister::process(sstable_direct
     // - If all shards scan in parallel, they can start loading sooner. That is faster than having
     //   a separate step to fetch all files, followed by another step to distribute and process.
 
-    directory_lister lister(_directory, lister::dir_entry_types::of<directory_entry_type::regular>(), &manifest_json_filter);
+    auto dir = co_await open_checked_directory(general_disk_error_handler, _directory.native());
+    auto lister = dir.experimental_list_directory();
+
     std::exception_ptr ex;
     try {
-        while (true) {
-            auto de = co_await lister.get();
-            if (!de) {
-                break;
+        while (auto de = co_await lister()) {
+            if (de->type != directory_entry_type::regular || !manifest_json_filter(_directory.native(), *de)) {
+                continue;
             }
+
             auto component_path = _directory / de->name;
             auto [ comps, ks, cf ] = sstables::parse_path(component_path);
             handle(std::move(comps), component_path);
@@ -311,7 +337,7 @@ future<> sstable_directory::filesystem_components_lister::process(sstable_direct
     } catch (...) {
         ex = std::current_exception();
     }
-    co_await lister.close();
+    co_await dir.close();
     if (ex) {
         dirlog.debug("Could not process sstable directory {}: {}", _directory, ex);
         // FIXME: waiting for https://github.com/scylladb/seastar/pull/1090
@@ -652,19 +678,35 @@ future<> sstable_directory::filesystem_components_lister::garbage_collect(storag
 future<> sstable_directory::filesystem_components_lister::cleanup_column_family_temp_sst_dirs() {
     std::vector<future<>> futures;
 
-    co_await lister::scan_dir(_directory, lister::dir_entry_types::of<directory_entry_type::directory>(), [&] (fs::path sstdir, directory_entry de) {
-        // push futures that remove files/directories into an array of futures,
-        // so that the supplied callback will not block scan_dir() from
-        // reading the next entry in the directory.
-        fs::path dirpath = sstdir / de.name;
-        if (dirpath.extension().string() == tempdir_extension) {
-            sstlog.info("Found temporary sstable directory: {}, removing", dirpath);
-            futures.push_back(io_check([dirpath = std::move(dirpath)] () { return lister::rmdir(dirpath); }));
-        }
-        return make_ready_future<>();
-    });
+    auto dir = co_await open_checked_directory(general_disk_error_handler, _directory.native());
+    auto lister = dir.experimental_list_directory();
 
+    std::exception_ptr ex;
+    try {
+        while (auto de = co_await lister()) {
+            if (de->type != directory_entry_type::directory || de->name[0] == '.') {
+                continue;
+            }
+
+            // push futures that remove files/directories into an array of futures,
+            // so that the supplied callback will not block lister from
+            // reading the next entry in the directory.
+            fs::path dirpath = _directory / de->name;
+            if (dirpath.extension().string() == tempdir_extension) {
+                sstlog.info("Found temporary sstable directory: {}, removing", dirpath);
+                futures.push_back(io_check([dirpath = std::move(dirpath)] () { return recursive_remove_directory(dirpath.native()); }));
+            }
+        }
+    } catch (...) {
+        ex = std::current_exception();
+    }
+
+    co_await dir.close();
     co_await when_all_succeed(futures.begin(), futures.end()).discard_result();
+
+    if (ex) {
+        std::rethrow_exception(std::move(ex));
+    }
 }
 
 future<> sstable_directory::filesystem_components_lister::handle_sstables_pending_delete() {
@@ -676,25 +718,41 @@ future<> sstable_directory::filesystem_components_lister::handle_sstables_pendin
 
     std::vector<future<>> futures;
 
-    co_await lister::scan_dir(pending_delete_dir, lister::dir_entry_types::of<directory_entry_type::regular>(), [this, &futures] (fs::path dir, directory_entry de) {
-        // push nested futures that remove files/directories into an array of futures,
-        // so that the supplied callback will not block scan_dir() from
-        // reading the next entry in the directory.
-        fs::path file_path = dir / de.name;
-        if (file_path.extension() == ".tmp") {
-            sstlog.info("Found temporary pending_delete log file: {}, deleting", file_path);
-            futures.push_back(remove_file(file_path.string()));
-        } else if (file_path.extension() == ".log") {
-            sstlog.info("Found pending_delete log file: {}, replaying", file_path);
-            auto f = replay_pending_delete_log(std::move(file_path));
-            futures.push_back(std::move(f));
-        } else {
-            sstlog.debug("Found unknown file in pending_delete directory: {}, ignoring", file_path);
-        }
-        return make_ready_future<>();
-    });
+    auto dir = co_await open_checked_directory(general_disk_error_handler, pending_delete_dir.native());
+    auto lister = dir.experimental_list_directory();
 
+    std::exception_ptr ex;
+    try {
+        while (auto de = co_await lister()) {
+            if (de->type != directory_entry_type::regular || de->name[0] == '.') {
+                continue;
+            }
+
+            // push nested futures that remove files/directories into an array of futures,
+            // so that the supplied callback will not block lister from
+            // reading the next entry in the directory.
+            fs::path file_path = pending_delete_dir / de->name;
+            if (file_path.extension() == ".tmp") {
+                sstlog.info("Found temporary pending_delete log file: {}, deleting", file_path);
+                futures.push_back(remove_file(file_path.string()));
+            } else if (file_path.extension() == ".log") {
+                sstlog.info("Found pending_delete log file: {}, replaying", file_path);
+                auto f = replay_pending_delete_log(std::move(file_path));
+                futures.push_back(std::move(f));
+            } else {
+                sstlog.debug("Found unknown file in pending_delete directory: {}, ignoring", file_path);
+            }
+        }
+    } catch (...) {
+        ex = std::current_exception();
+    }
+
+    co_await dir.close();
     co_await when_all_succeed(futures.begin(), futures.end()).discard_result();
+
+    if (ex) {
+        std::rethrow_exception(std::move(ex));
+    }
 }
 
 future<sstables::generation_type>
