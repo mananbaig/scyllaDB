@@ -126,6 +126,7 @@ def make_scylla_conf(mode: str, workdir: pathlib.Path, host_addr: str, seed_addr
         'maintenance_socket': socket_path,
 
         'service_levels_interval_ms': 500,
+        'alternator_allow_system_table_write': True,
     }
 
 # Seastar options can not be passed through scylla.yaml, use command line

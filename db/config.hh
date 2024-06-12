@@ -413,6 +413,7 @@ public:
     named_value<uint32_t> alternator_timeout_in_ms;
     named_value<double> alternator_ttl_period_in_seconds;
     named_value<sstring> alternator_describe_endpoints;
+    named_value<bool> alternator_allow_system_table_write;
 
     named_value<bool> abort_on_ebadf;
 

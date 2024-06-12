@@ -1090,6 +1090,9 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "the same endpoint used in the request. The string 'disabled' "
         "disables the DescribeEndpoints operation. Any other string is the "
         "fixed value that will be returned by DescribeEndpoints operations.")
+    , alternator_allow_system_table_write(this, "alternator_allow_system_table_write", liveness::LiveUpdate, value_status::Used,
+        false,
+        "Allow writing to system tables using the .scylla.alternator.system prefix")
     , abort_on_ebadf(this, "abort_on_ebadf", value_status::Used, true, "Abort the server on incorrect file descriptor access. Throws exception when disabled.")
     , redis_port(this, "redis_port", value_status::Used, 0, "Port on which the REDIS transport listens for clients.")
     , redis_ssl_port(this, "redis_ssl_port", value_status::Used, 0, "Port on which the REDIS TLS native transport listens for clients.")
