@@ -19,7 +19,7 @@ This document lists the currently proposed solutions and lists the selected prop
 
 # Proposed solutions
 
-## 1. Short term mitigation
+## 1. Short term mitigation (disable/enable load balancing)
 
 We can disable any background load balancing operations (if any are running) and execute the
 truncate as it is currently implemented. We would issue a RPC which performs a memtable flush,
@@ -47,7 +47,17 @@ truncate is still running, causing the same problem with resurrected data due to
 If the node which controls the truncate operation crashes before truncate is complete,
 it will leave load balancing disabled.
 
-## 2. Truncate as a topology operation
+## 2. Short term mitigation (holding ERM pointer)
+
+Holding an effective replication map pointer on any node will pause load balancing until
+the pointer is released. Therefor, obtaining an ERM pointer before truncate starts will
+pause load balancing operations until truncate is complete, when the ERM pointer can be
+released, which will resume load balancing.
+
+This solution does not suffer from the problems with concurrent truncate operations, or
+with manual load balancing disable/enable by an admin.
+
+## 3. Truncate as a topology operation
 
 We need a barrier that will wait on any on-going tablet transitions on the truncated table
 AND on its subordinate views (materialized views and secondary indexes), and prevent any new
@@ -62,7 +72,7 @@ For the latter, we’ll need to pass the snapshot tag (a.k.a name) so the distri
 use the same tag. This is harder, but we want to support a distributed snapshot anyhow in the future
 for integrating backup with tablets (and the object storage stack).
 
-## 3. Truncate with tombstones stored in SSTables
+## 4. Truncate with tombstones stored in SSTables
 
 We need to implement a new type of token-range tombstone which will be stored in SSTables.
 The advantage of this solution is that it fits well into the current tombstone logic since we already
@@ -82,7 +92,7 @@ range tombstones have a wider applicability. However, further discussion is need
 the details about the use of these tombstones, how they should look like and how they should
 propagate.
 
-## 4. Truncate with tombstones stored in table schema
+## 5. Truncate with tombstones stored in table schema
 
 With this solution we would store the tombstone in the table schema. The advantages are that
 it would  be easier to integrate with the readers since they already have access to the schema.
@@ -92,9 +102,8 @@ during truncate. This solution does not require all nodes to be up.
 
 # Accepted solution
 
-The [Short term mitigation](#1-short-term-mitigation) solution was chosen because of simplicity
-of implementation. While it does have problems, those will be addressed in subsequent iterative
-improvements.
+The __Short term mitigation (holding ERM pointer)__ solution was chosen because of simplicity
+of implementation.
 
 All other proposed solutions need further discussion to clarify the details of implementation
 and find any remaining potential pitfalls.
