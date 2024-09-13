@@ -836,7 +836,7 @@ future<> database::update_keyspace_on_all_shards(sharded<database>& sharded_db, 
                 ks.metadata()->cf_meta_data() | std::views::values | std::ranges::to<std::vector>(), std::move(ks.metadata()->user_types()), ksm.get_storage_options());
 
         auto change = co_await db.prepare_update_keyspace(ks, new_ksm);
-        db.update_keyspace(std::move(change));
+        db.update_keyspace(std::make_unique<keyspace_change>(std::move(change)));
         co_return;
     });
 }
