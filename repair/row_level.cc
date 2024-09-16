@@ -2529,6 +2529,7 @@ class row_level_repair {
     dht::token_range _range;
     inet_address_vector_replica_set _all_live_peer_nodes;
     std::vector<std::optional<shard_id>> _all_live_peer_shards;
+    tracing::trace_state_ptr _trace_state;
     bool _small_table_optimization;
 
     // Repair master and followers will propose a sync boundary. Each of them
@@ -2580,12 +2581,14 @@ public:
             table_id table_id,
             dht::token_range range,
             std::vector<gms::inet_address> all_live_peer_nodes,
+            tracing::trace_state_ptr trace_state,
             bool small_table_optimization)
         : _shard_task(shard_task)
         , _cf_name(std::move(cf_name))
         , _table_id(std::move(table_id))
         , _range(std::move(range))
         , _all_live_peer_nodes(sort_peer_nodes(all_live_peer_nodes))
+        , _trace_state(std::move(trace_state))
         , _small_table_optimization(small_table_optimization)
         , _seed(get_random_seed())
         , _start_time(gc_clock::now())
@@ -2634,6 +2637,8 @@ private:
         _combined_hashes.clear();
         _zero_rows = false;
         rlogger.debug("ROUND {}, _last_sync_boundary={}, _current_sync_boundary={}, _skipped_sync_boundary={}",
+                master.stats().round_nr, master.last_sync_boundary(), master.current_sync_boundary(), _skipped_sync_boundary);
+        tracing::trace(_trace_state, "negotiate_sync_boundary(): round: {}, _last_sync_boundary: {}, _current_sync_boundary: {}, _skipped_sync_boundary: {}",
                 master.stats().round_nr, master.last_sync_boundary(), master.current_sync_boundary(), _skipped_sync_boundary);
         master.stats().round_nr++;
         parallel_for_each(master.all_nodes(), coroutine::lambda([&] (repair_node_state& ns) -> future<> {
@@ -2932,6 +2937,8 @@ private:
 public:
     future<> run() {
         return seastar::async([this] {
+            tracing::trace(_trace_state, "starting row-level repair");
+
             _shard_task.check_in_abort_or_shutdown();
             auto repair_meta_id = _shard_task.rs.get_next_repair_meta_id().get();
             auto algorithm = get_common_diff_detect_algorithm(_shard_task.messaging.local(), _all_live_peer_nodes);
@@ -2956,6 +2963,9 @@ public:
             auto mem_permit = seastar::get_units(mem_sem, wanted).get();
             rlogger.trace("repair[{}]: Finished to get memory budget, wanted={}, available={}, max_repair_memory={}",
                     _shard_task.global_repair_id.uuid(), wanted, mem_sem.current(), max);
+
+            tracing::trace(_trace_state, "repair meta id: {}, diff detection algorithm: {}, max_row_buf_size: {}; memory budget: wanted={}, available={}, max_repair_memory={}",
+                    repair_meta_id, algorithm, max_row_buf_size, wanted, mem_sem.current(), max);
 
             auto permit = _shard_task.db.local().obtain_reader_permit(_shard_task.db.local().find_column_family(_table_id), "repair-meta", db::no_timeout, {}).get();
 
@@ -3082,14 +3092,22 @@ public:
             }
             rlogger.debug("<<< Finished Row Level Repair (Master): local={}, peers={}, repair_meta_id={}, keyspace={}, cf={}, range={}, tx_hashes_nr={}, rx_hashes_nr={}, tx_row_nr={}, rx_row_nr={}, row_from_disk_bytes={}, row_from_disk_nr={}",
                     master.myip(), _all_live_peer_nodes, master.repair_meta_id(), _shard_task.get_keyspace(), _cf_name, _range, master.stats().tx_hashes_nr, master.stats().rx_hashes_nr, master.stats().tx_row_nr, master.stats().rx_row_nr, master.stats().row_from_disk_bytes, master.stats().row_from_disk_nr);
+
+            tracing::trace(_trace_state, "finished row-level repair: tx_hashes_nr={}, rx_hashes_nr={}, tx_row_nr={}, rx_row_nr={}, row_from_disk_bytes={}, row_from_disk_nr={}",
+                    master.stats().tx_hashes_nr, master.stats().rx_hashes_nr, master.stats().tx_row_nr, master.stats().rx_row_nr, master.stats().row_from_disk_bytes, master.stats().row_from_disk_nr);
         });
     }
 };
 
-future<> repair_cf_range_row_level(repair::shard_repair_task_impl& shard_task,
-        sstring cf_name, table_id table_id, dht::token_range range,
-        const std::vector<gms::inet_address>& all_peer_nodes, bool small_table_optimization) {
-    auto repair = row_level_repair(shard_task, std::move(cf_name), std::move(table_id), std::move(range), all_peer_nodes, small_table_optimization);
+future<> repair_cf_range_row_level(
+        repair::shard_repair_task_impl& shard_task,
+        sstring cf_name,
+        table_id table_id,
+        dht::token_range range,
+        const std::vector<gms::inet_address>& all_peer_nodes,
+        tracing::trace_state_ptr trace_state,
+        bool small_table_optimization) {
+    auto repair = row_level_repair(shard_task, std::move(cf_name), std::move(table_id), std::move(range), all_peer_nodes, std::move(trace_state), small_table_optimization);
     co_return co_await repair.run();
 }
 

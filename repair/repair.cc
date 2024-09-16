@@ -618,7 +618,8 @@ repair::shard_repair_task_impl::shard_repair_task_impl(tasks::task_manager::modu
         streaming::stream_reason reason_,
         bool hints_batchlog_flushed,
         bool small_table_optimization,
-        std::optional<int> ranges_parallelism)
+        std::optional<int> ranges_parallelism,
+        tracing::trace_state_ptr trace_state)
     : repair_task_impl(module, id, 0, "shard", keyspace, "", "", parent_id_.uuid(), reason_)
     , rs(repair)
     , db(repair.get_db())
@@ -636,6 +637,7 @@ repair::shard_repair_task_impl::shard_repair_task_impl(tasks::task_manager::modu
     , total_rf(erm->get_replication_factor())
     , _hints_batchlog_flushed(std::move(hints_batchlog_flushed))
     , _small_table_optimization(small_table_optimization)
+    , _trace_state(std::move(trace_state))
     , _user_ranges_parallelism(ranges_parallelism ? std::optional<semaphore>(semaphore(*ranges_parallelism)) : std::nullopt)
 {
     rlogger.debug("repair[{}]: Setting user_ranges_parallelism to {}", global_repair_id.uuid(),
@@ -741,8 +743,32 @@ future<> repair::shard_repair_task_impl::repair_range(const dht::token_range& ra
         co_return;
     }
     try {
+        tracing::trace_state_ptr child_trace_state;
+        if (_trace_state) {
+            tracing::trace_state_props_set trace_props;
+            trace_props.set<tracing::trace_state_props::full_tracing>();
+            child_trace_state = tracing::tracing::get_local_tracing_instance().create_session(tracing::trace_type::REPAIR, trace_props);
+            tracing::begin(child_trace_state, "repair range", gms::inet_address("127.0.0.1"));
+
+            tracing::add_session_param(child_trace_state, "parent_session_id", fmt::to_string(_trace_state->session_id()));
+            tracing::add_session_param(child_trace_state, "keyspace", _status.keyspace);
+            tracing::add_session_param(child_trace_state, "table", table.name);
+            tracing::add_session_param(child_trace_state, "table_id", fmt::to_string(table.id));
+            tracing::add_session_param(child_trace_state, "range", fmt::to_string(range));
+            tracing::add_session_param(child_trace_state, "neighbors", fmt::to_string(neighbors));
+            tracing::add_session_param(child_trace_state, "small_table_optimization", fmt::to_string(_small_table_optimization));
+            tracing::add_table_name(child_trace_state, _status.keyspace, table.name);
+
+            // Link the two sessions together, this is mainly for humans, we
+            // already do this in the session parameters above.
+            tracing::trace(_trace_state, "repair_range(): table.id: {}, table.name: {}, range: {}, child repair trace session id: {}",
+                    table.id, table.name, range, child_trace_state->session_id());
+            tracing::trace(child_trace_state, "repair_range(): table.id: {}, table.name: {}, range: {}, parent repair trace session id: {}",
+                    table.id, table.name, range, _trace_state->session_id());
+        }
+
         auto dropped = co_await with_table_drop_silenced(db.local(), mm, table.id, [&] (const table_id& uuid) {
-            return repair_cf_range_row_level(*this, table.name, table.id, range, neighbors, _small_table_optimization);
+            return repair_cf_range_row_level(*this, table.name, table.id, range, neighbors, child_trace_state, _small_table_optimization);
         });
         if (dropped) {
             dropped_tables.insert(table.name);
@@ -830,6 +856,10 @@ struct repair_options {
     // to repair.
     sstring start_token;
     sstring end_token;
+    // If true, repair will store tracing information in system.traces.
+    // There is a primary tracing session created for the entire repair and
+    // secondary tracing session for each individual range repair.
+    bool trace = false;
     // column_families is the list of column families to repair in the given
     // keyspace. If this list is empty (the default), all the column families
     // in this keyspace are repaired
@@ -878,11 +908,8 @@ struct repair_options {
         string_opt(start_token, options, START_TOKEN);
         string_opt(end_token, options, END_TOKEN);
 
-        bool trace = false;
         bool_opt(trace, options, TRACE_KEY);
-        if (trace) {
-            throw std::runtime_error("unsupported trace");
-        }
+
         // Consume, ignore.
         int job_threads;
         int_opt(job_threads, options, JOB_THREADS_KEY);
@@ -1125,9 +1152,30 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
     // yet. The id field of repair_uniq_ids returned by next_repair_command()
     // will be >= 1.
     auto id = _repair_module->new_repair_uniq_id();
-    rlogger.info("repair[{}]: starting user-requested repair for keyspace {}, repair id {}, options {}", id.uuid(), keyspace, id.id, options_map);
 
     repair_options options(options_map);
+
+    tracing::trace_state_ptr trace_state;
+    sstring trace_description;
+
+    if (options.trace) {
+        tracing::trace_state_props_set trace_props;
+        trace_props.set<tracing::trace_state_props::full_tracing>();
+        trace_state = tracing::tracing::get_local_tracing_instance().create_session(tracing::trace_type::REPAIR, trace_props);
+        // While in theory the client can be on a remote machine, in all our current
+        // production setups, client is always talking to the REST api via either
+        // a tunnel or an agent, so in practice its IP will always be localhost.
+        tracing::begin(trace_state, "user requested repair", gms::inet_address("127.0.0.1"));
+
+        tracing::add_session_param(trace_state, "repair_id", fmt::to_string(id.id));
+        tracing::add_session_param(trace_state, "repair_uuid", fmt::to_string(id.uuid()));
+        tracing::add_session_param(trace_state, "keyspace", keyspace);
+        tracing::add_session_param(trace_state, "options", fmt::to_string(options_map));
+
+        trace_description = format(", tracing session id {}", trace_state->session_id());
+    }
+
+    rlogger.info("repair[{}]: starting user-requested repair for keyspace {}, repair id {}{}, options {}", id.uuid(), keyspace, id.id, trace_description, options_map);
 
     std::vector<sstring> cfs =
         options.column_families.size() ? options.column_families : list_column_families(db, keyspace);
@@ -1211,7 +1259,7 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
 
             bool primary_replica_only = options.primary_range;
             auto ranges_parallelism = options.ranges_parallelism == -1 ? std::nullopt : std::optional<int>(options.ranges_parallelism);
-            co_await repair_tablets(id, keyspace, cfs, host2ip, primary_replica_only, options.ranges, options.data_centers, hosts, ignore_nodes, ranges_parallelism);
+            co_await repair_tablets(id, keyspace, cfs, host2ip, primary_replica_only, options.ranges, options.data_centers, hosts, ignore_nodes, ranges_parallelism, std::move(trace_state));
             co_return id.id;
         }
     }
@@ -1316,7 +1364,7 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
     }
 
     auto ranges_parallelism = options.ranges_parallelism == -1 ? std::nullopt : std::optional<int>(options.ranges_parallelism);
-    auto task = co_await _repair_module->make_and_start_task<repair::user_requested_repair_task_impl>({}, id, std::move(keyspace), "", germs, std::move(cfs), std::move(ranges), std::move(options.hosts), std::move(options.data_centers), std::move(ignore_nodes), small_table_optimization, ranges_parallelism);
+    auto task = co_await _repair_module->make_and_start_task<repair::user_requested_repair_task_impl>({}, id, std::move(keyspace), "", germs, std::move(cfs), std::move(ranges), std::move(options.hosts), std::move(options.data_centers), std::move(ignore_nodes), small_table_optimization, ranges_parallelism, std::move(trace_state));
     co_return id.id;
 }
 
@@ -1388,13 +1436,28 @@ future<> repair::user_requested_repair_task_impl::run() {
 
         auto ranges_parallelism = _ranges_parallelism;
         bool small_table_optimization = _small_table_optimization;
+        auto trace_state = tracing::global_trace_state_ptr(_trace_state);
         for (auto shard : boost::irange(unsigned(0), smp::count)) {
             auto f = rs.container().invoke_on(shard, [keyspace, table_ids, id, ranges, hints_batchlog_flushed, ranges_parallelism, small_table_optimization,
-                    data_centers, hosts, ignore_nodes, parent_data = get_repair_uniq_id().task_info, germs] (repair_service& local_repair) mutable -> future<> {
+                    trace_state, data_centers, hosts, ignore_nodes, parent_data = get_repair_uniq_id().task_info, germs] (repair_service& local_repair) mutable -> future<> {
                 local_repair.get_metrics().repair_total_ranges_sum += ranges.size();
-                auto task = co_await local_repair._repair_module->make_and_start_task<repair::shard_repair_task_impl>(parent_data, tasks::task_id::create_random_id(), keyspace,
-                        local_repair, germs->get().shared_from_this(), std::move(ranges), std::move(table_ids),
-                        id, std::move(data_centers), std::move(hosts), std::move(ignore_nodes), streaming::stream_reason::repair, hints_batchlog_flushed, small_table_optimization, ranges_parallelism);
+                auto task = co_await local_repair._repair_module->make_and_start_task<repair::shard_repair_task_impl>(
+                        parent_data,
+                        tasks::task_id::create_random_id(),
+                        keyspace,
+                        local_repair,
+                        germs->get().shared_from_this(),
+                        std::move(ranges),
+                        std::move(table_ids),
+                        id,
+                        std::move(data_centers),
+                        std::move(hosts),
+                        std::move(ignore_nodes),
+                        streaming::stream_reason::repair,
+                        hints_batchlog_flushed,
+                        small_table_optimization,
+                        ranges_parallelism,
+                        trace_state.get());
                 co_await task->done();
             });
             repair_results.push_back(std::move(f));
@@ -1516,7 +1579,7 @@ future<> repair::data_sync_repair_task_impl::run() {
                 auto ranges_parallelism = std::nullopt;
                 auto task_impl_ptr = seastar::make_shared<repair::shard_repair_task_impl>(local_repair._repair_module, tasks::task_id::create_random_id(), keyspace,
                         local_repair, germs->get().shared_from_this(), std::move(ranges), std::move(table_ids),
-                        id, std::move(data_centers), std::move(hosts), std::move(ignore_nodes), reason, hints_batchlog_flushed, small_table_optimization, ranges_parallelism);
+                        id, std::move(data_centers), std::move(hosts), std::move(ignore_nodes), reason, hints_batchlog_flushed, small_table_optimization, ranges_parallelism, nullptr);
                 task_impl_ptr->neighbors = std::move(neighbors);
                 auto task = co_await local_repair._repair_module->make_task(std::move(task_impl_ptr), parent_data);
                 task->start();
@@ -2204,7 +2267,18 @@ static std::unordered_set<gms::inet_address> get_token_owners_in_dcs(std::vector
 }
 
 // Repair all tablets belong to this node for the given table
-future<> repair_service::repair_tablets(repair_uniq_id rid, sstring keyspace_name, std::vector<sstring> table_names, host2ip_t host2ip, bool primary_replica_only, dht::token_range_vector ranges_specified, std::vector<sstring> data_centers, std::unordered_set<gms::inet_address> hosts, std::unordered_set<gms::inet_address> ignore_nodes, std::optional<int> ranges_parallelism) {
+future<> repair_service::repair_tablets(
+        repair_uniq_id rid,
+        sstring keyspace_name,
+        std::vector<sstring> table_names,
+        host2ip_t host2ip,
+        bool primary_replica_only,
+        dht::token_range_vector ranges_specified,
+        std::vector<sstring> data_centers,
+        std::unordered_set<gms::inet_address> hosts,
+        std::unordered_set<gms::inet_address> ignore_nodes,
+        std::optional<int> ranges_parallelism,
+        tracing::trace_state_ptr trace_state) {
     std::vector<tablet_repair_task_meta> task_metas;
     for (auto& table_name : table_names) {
         lw_shared_ptr<replica::table> t;
@@ -2373,7 +2447,8 @@ future<> repair_service::repair_tablets(repair_uniq_id rid, sstring keyspace_nam
             }
         }
     }
-    auto task = co_await _repair_module->make_and_start_task<repair::tablet_repair_task_impl>({}, rid, keyspace_name, table_names, streaming::stream_reason::repair, std::move(task_metas), ranges_parallelism);
+    auto task = co_await _repair_module->make_and_start_task<repair::tablet_repair_task_impl>({}, rid, keyspace_name, table_names,
+            streaming::stream_reason::repair, std::move(task_metas), ranges_parallelism, std::move(trace_state));
 }
 
 future<> repair::tablet_repair_task_impl::run() {
@@ -2434,8 +2509,9 @@ future<> repair::tablet_repair_task_impl::run() {
             }
         });
 
-
-        rs.container().invoke_on_all([&idx, id, metas = _metas, parent_data, reason = _reason, tables = _tables, ranges_parallelism = _ranges_parallelism] (repair_service& rs) -> future<> {
+        auto trace_state = tracing::global_trace_state_ptr(_trace_state);
+        rs.container().invoke_on_all([&idx, id, metas = _metas, parent_data, reason = _reason, tables = _tables, ranges_parallelism = _ranges_parallelism,
+                trace_state = std::move(trace_state)] (repair_service& rs) -> future<> {
             std::exception_ptr error;
             for (auto& m : metas) {
                 if (m.master_shard_id != this_shard_id()) {
@@ -2470,7 +2546,7 @@ future<> repair::tablet_repair_task_impl::run() {
 
                 auto task_impl_ptr = seastar::make_shared<repair::shard_repair_task_impl>(rs._repair_module, tasks::task_id::create_random_id(),
                         m.keyspace_name, rs, erm, std::move(ranges), std::move(table_ids), id, std::move(data_centers), std::move(hosts),
-                        std::move(ignore_nodes), reason, hints_batchlog_flushed, small_table_optimization, ranges_parallelism);
+                        std::move(ignore_nodes), reason, hints_batchlog_flushed, small_table_optimization, ranges_parallelism, trace_state.get());
                 task_impl_ptr->neighbors = std::move(neighbors);
                 auto task = co_await rs._repair_module->make_task(std::move(task_impl_ptr), parent_data);
                 task->start();

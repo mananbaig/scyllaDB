@@ -170,7 +170,18 @@ private:
             shared_ptr<node_ops_info> ops_info);
 
 public:
-    future<> repair_tablets(repair_uniq_id id, sstring keyspace_name, std::vector<sstring> table_names, host2ip_t host2ip, bool primary_replica_only = true, dht::token_range_vector ranges_specified = {}, std::vector<sstring> dcs = {}, std::unordered_set<gms::inet_address> hosts = {}, std::unordered_set<gms::inet_address> ignore_nodes = {}, std::optional<int> ranges_parallelism = std::nullopt);
+    future<> repair_tablets(
+            repair_uniq_id id,
+            sstring keyspace_name,
+            std::vector<sstring> table_names,
+            host2ip_t host2ip,
+            bool primary_replica_only = true,
+            dht::token_range_vector ranges_specified = {},
+            std::vector<sstring> dcs = {},
+            std::unordered_set<gms::inet_address> hosts = {},
+            std::unordered_set<gms::inet_address> ignore_nodes = {},
+            std::optional<int> ranges_parallelism = std::nullopt,
+            tracing::trace_state_ptr trace_state = {});
 
 private:
 
@@ -263,9 +274,14 @@ class repair_row;
 class repair_hasher;
 class repair_writer;
 
-future<> repair_cf_range_row_level(repair::shard_repair_task_impl& shard_task,
-        sstring cf_name, table_id table_id, dht::token_range range,
-        const std::vector<gms::inet_address>& all_peer_nodes, bool small_table_optimization);
+future<> repair_cf_range_row_level(
+        repair::shard_repair_task_impl& shard_task,
+        sstring cf_name,
+        table_id table_id,
+        dht::token_range range,
+        const std::vector<gms::inet_address>& all_peer_nodes,
+        tracing::trace_state_ptr trace_state,
+        bool small_table_optimization);
 future<std::list<repair_row>> to_repair_rows_list(repair_rows_on_wire rows,
         schema_ptr s, uint64_t seed, repair_master is_master,
         reader_permit permit, repair_hasher hasher);
