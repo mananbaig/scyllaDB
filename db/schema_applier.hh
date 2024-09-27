@@ -10,8 +10,8 @@
 #pragma once
 
 #include "mutation/mutation.hh"
-#include "seastar/core/future.hh"
 #include "service/storage_proxy.hh"
+#include "replica/database.hh"
 #include "query-result-set.hh"
 #include "db/schema_tables.hh"
 #include "schema/schema_registry.hh"
@@ -46,11 +46,20 @@ struct schema_persisted_state {
     schema_tables::schema_result scylla_aggregates;
 };
 
-// groups keyspaces based on what is happening to them during schema change
-struct affected_keyspaces {
+struct affected_keyspaces_names {
     std::set<sstring> created;
     std::set<sstring> altered;
     std::set<sstring> dropped;
+};
+
+// groups keyspaces based on what is happening to them during schema change
+struct affected_keyspaces {
+    std::vector<replica::database::created_keyspace_per_shard> created;
+    std::vector<replica::database::keyspace_change_per_shard> altered;
+    // names need to be copied here as they are used multiple times and
+    // keyspace struct from which we obtain the name is moved when
+    // we commit it
+    affected_keyspaces_names names;
 };
 
 struct affected_user_types_per_shard {
@@ -110,6 +119,9 @@ class schema_applier {
     schema_persisted_state _after;
 
     affected_keyspaces _affected_keyspaces;
+    // during commit we move out some content of _affected_keyspaces,
+    // we need just names for notify function
+    affected_keyspaces_names _affected_keyspaces_names;
     affected_user_types _affected_user_types;
     affected_tables_and_views _affected_tables_and_views;
 
@@ -134,11 +146,14 @@ public:
     // Makes updates visible. Before calling this function in memory state as observed by other
     // components should not yet change. The function atomically switches current state with
     // new state (the one built in update function).
-    void commit();
+    future<> commit();
     // Notify is called after commit and allows to trigger code which can't provide
     // atomicity either for legacy reasons or causes side effects to an external system
     // (e.g. informing client's driver).
     future<> notify();
+
+private:
+    void commit_on_shard(replica::database& db);
 };
 
 }
