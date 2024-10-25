@@ -435,6 +435,60 @@ const tablet_transition_info* tablet_map::get_tablet_transition_info(tablet_id i
     return &i->second;
 }
 
+const tablet_replica_set& tablet_map::get_replicas_for_reading(const tablet_id tablet) const {
+    auto&& info = get_tablet_transition_info(tablet);
+    auto&& replicas = std::invoke([&]() -> const tablet_replica_set& {
+        if (!info) {
+            return get_tablet_info(tablet).replicas;
+        }
+        switch (info->reads) {
+            case read_replica_set_selector::previous:
+                return get_tablet_info(tablet).replicas;
+            case read_replica_set_selector::next: {
+                return info->next;
+            }
+        }
+        on_internal_error(tablet_logger, format("Invalid replica selector {}", static_cast<int>(info->reads)));
+    });
+    return replicas;
+}
+
+const tablet_replica_set& tablet_map::get_replicas_for_writing(const tablet_id tablet) const {
+    auto* info = get_tablet_transition_info(tablet);
+    auto&& replicas = std::invoke([&]() -> const tablet_replica_set& {
+        if (!info) {
+            return get_tablet_info(tablet).replicas;
+        }
+        switch (info->writes) {
+            case write_replica_set_selector::previous:
+                [[fallthrough]];
+            case write_replica_set_selector::both:
+                return get_tablet_info(tablet).replicas;
+            case write_replica_set_selector::next: {
+                return info->next;
+            }
+        }
+        on_internal_error(tablet_logger, format("Invalid replica selector {}", static_cast<int>(info->writes)));
+    });
+    return replicas;
+}
+
+const tablet_replica* tablet_map::get_pending_replica(const tablet_id tablet) const {
+    auto&& info = get_tablet_transition_info(tablet);
+    if (!info || info->transition == tablet_transition_kind::intranode_migration) {
+        return nullptr;
+    }
+    switch (info->writes) {
+        case write_replica_set_selector::previous:
+            return nullptr;
+        case write_replica_set_selector::both:
+            return (info->pending_replica.has_value() ? &(*info->pending_replica) : nullptr);
+        case write_replica_set_selector::next:
+            return nullptr;
+    }
+    on_internal_error(tablet_logger, format("Invalid replica selector {}", static_cast<int>(info->writes)));
+}
+
 // The names are persisted in system tables so should not be changed.
 static const std::unordered_map<tablet_transition_stage, sstring> tablet_transition_stage_to_name = {
     {tablet_transition_stage::allow_write_both_read_old, "allow_write_both_read_old"},
@@ -734,22 +788,7 @@ private:
     const tablet_replica_set& get_replicas_for_write(dht::token search_token) const {
         auto&& tablets = get_tablet_map();
         auto tablet = tablets.get_tablet_id(search_token);
-        auto* info = tablets.get_tablet_transition_info(tablet);
-        auto&& replicas = std::invoke([&] () -> const tablet_replica_set& {
-            if (!info) {
-                return tablets.get_tablet_info(tablet).replicas;
-            }
-            switch (info->writes) {
-                case write_replica_set_selector::previous:
-                    [[fallthrough]];
-                case write_replica_set_selector::both:
-                    return tablets.get_tablet_info(tablet).replicas;
-                case write_replica_set_selector::next: {
-                    return info->next;
-                }
-            }
-            on_internal_error(tablet_logger, format("Invalid replica selector {}", static_cast<int>(info->writes)));
-        });
+        auto&& replicas = tablets.get_replicas_for_writing(tablet);
         tablet_logger.trace("get_replicas_for_write({}): table={}, tablet={}, replicas={}", search_token, _table, tablet, replicas);
         return replicas;
     }
@@ -758,49 +797,24 @@ private:
     Set get_pending_helper(const token& search_token) const {
         auto&& tablets = get_tablet_map();
         auto tablet = tablets.get_tablet_id(search_token);
-        auto&& info = tablets.get_tablet_transition_info(tablet);
-        if (!info || info->transition == tablet_transition_kind::intranode_migration) {
-            return {};
+        const auto* replica = tablets.get_pending_replica(tablet);
+
+        if (!replica) {
+            return Set{};
         }
-        switch (info->writes) {
-            case write_replica_set_selector::previous:
-                return {};
-            case write_replica_set_selector::both: {
-                if (!info->pending_replica) {
-                    return {};
-                }
-                tablet_logger.trace("get_pending_endpoints({}): table={}, tablet={}, replica={}",
-                                    search_token, _table, tablet, *info->pending_replica);
-                if constexpr (std::is_same_v<Set, inet_address_vector_topology_change>) {
-                    return {_tmptr->get_endpoint_for_host_id(info->pending_replica->host)};
-                } else {
-                    return {info->pending_replica->host};
-                }
-            }
-            case write_replica_set_selector::next:
-                return {};
+
+        if constexpr (std::is_same_v<Set, inet_address_vector_topology_change>) {
+            return {_tmptr->get_endpoint_for_host_id(replica->host)};
+        } else {
+            return {replica->host};
         }
-        on_internal_error(tablet_logger, format("Invalid replica selector", static_cast<int>(info->writes)));
     }
 
     template<typename Set>
     Set get_for_reading_helper(const token& search_token) const {
         auto&& tablets = get_tablet_map();
         auto tablet = tablets.get_tablet_id(search_token);
-        auto&& info = tablets.get_tablet_transition_info(tablet);
-        auto&& replicas = std::invoke([&] () -> const tablet_replica_set& {
-            if (!info) {
-                return tablets.get_tablet_info(tablet).replicas;
-            }
-            switch (info->reads) {
-                case read_replica_set_selector::previous:
-                    return tablets.get_tablet_info(tablet).replicas;
-                case read_replica_set_selector::next: {
-                    return info->next;
-                }
-            }
-            on_internal_error(tablet_logger, format("Invalid replica selector", static_cast<int>(info->reads)));
-        });
+        auto&& replicas = tablets.get_replicas_for_reading(tablet);
         tablet_logger.trace("get_endpoints_for_reading({}): table={}, tablet={}, replicas={}", search_token, _table, tablet, replicas);
         if constexpr (std::is_same_v<Set, inet_address_vector_replica_set>) {
             auto result = to_replica_set(replicas);
@@ -810,7 +824,6 @@ private:
             return to_host_set(replicas);
         }
     }
-
 
 public:
     tablet_effective_replication_map(table_id table,
