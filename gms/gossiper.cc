@@ -48,6 +48,7 @@
 #include "utils/error_injection.hh"
 #include "idl/gossip.dist.hh"
 #include <csignal>
+#include "utils/labels.hh"
 
 namespace gms {
 
@@ -113,15 +114,15 @@ gossiper::gossiper(abort_source& as, const locator::shared_token_metadata& stm, 
                 } else {
                     return 0;
                 }
-            }, sm::description("Heartbeat of the current Node.")),
+            }, sm::description("Heartbeat of the current Node."))(basic_level),
         sm::make_gauge("live",
             [this] {
                 return _live_endpoints.size();
-            }, sm::description("How many live nodes the current node sees")),
+            }, sm::description("How many live nodes the current node sees"))(basic_level),
         sm::make_gauge("unreachable",
             [this] {
                 return _unreachable_endpoints.size();
-            }, sm::description("How many unreachable nodes the current node sees")),
+            }, sm::description("How many unreachable nodes the current node sees"))(basic_level),
     });
 }
 
