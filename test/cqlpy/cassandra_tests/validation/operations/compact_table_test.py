@@ -21,12 +21,13 @@
 
 from cassandra_tests.porting import *
 
+
 # ALTER ... DROP COMPACT STORAGE was recently dropped (unless a special
 # flag is used) by Cassandra, and it was never implemented in Scylla, so
 # let's skip its test.
 # See issue #3882
 @pytest.mark.skip
-def testDropCompactStorage(cql, test_keyspace):
+def testDropCompactStorage(compact_storage, cql, test_keyspace):
     with create_table(cql, test_keyspace, "(pk int, ck int, PRIMARY KEY(pk)) WITH COMPACT STORAGE") as table:
         execute(cql, table, "INSERT INTO %s (pk, ck) VALUES (1, 1)")
         execute(cql, table, "ALTER TABLE %s DROP COMPACT STORAGE")
@@ -43,7 +44,7 @@ def testDropCompactStorage(cql, test_keyspace):
         assertRows(execute(cql, table,  "SELECT * FROM %s"),
                    row(1, 1, 1))
 
-def testCompactStorageSemantics(cql, test_keyspace):
+def testCompactStorageSemantics(compact_storage, cql, test_keyspace):
     with create_table(cql, test_keyspace, "(pk int, ck int, PRIMARY KEY(pk, ck)) WITH COMPACT STORAGE") as table:
         execute(cql, table, "INSERT INTO %s (pk, ck) VALUES (?, ?)", 1, 1)
         execute(cql, table, "DELETE FROM %s WHERE pk = ? AND ck = ?", 1, 1)
@@ -54,7 +55,7 @@ def testCompactStorageSemantics(cql, test_keyspace):
         assertRows(execute(cql, table, "SELECT * FROM %s WHERE pk = ?",2),
                    row(2, 2, null, 2))
 
-def testColumnDeletionWithCompactTableWithMultipleColumns(cql, test_keyspace):
+def testColumnDeletionWithCompactTableWithMultipleColumns(compact_storage, cql, test_keyspace):
     with create_table(cql, test_keyspace, "(pk int PRIMARY KEY, v1 int, v2 int) WITH COMPACT STORAGE") as table:
         execute(cql, table, "INSERT INTO %s (pk, v1, v2) VALUES (1, 1, 1) USING TIMESTAMP 1000")
         flush(cql, table)
