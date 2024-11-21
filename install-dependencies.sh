@@ -143,6 +143,9 @@ declare -A pip_packages=(
     [allure-pytest]=
     [pytest-xdist]=
     [universalasync]=
+    [deepdiff]=
+    [cryptography]=
+    [boto3-stubs[dynamodb]]=
 )
 
 pip_symlinks=(

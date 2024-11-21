@@ -9,6 +9,9 @@ import os
 import sys
 import time
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
+
+from test.dtest.ccmlib.scylla_node import ScyllaNode
 
 
 logger = logging.getLogger(__name__)
@@ -70,6 +73,16 @@ class ImmutableMapping(Mapping):
 
     def __repr__(self):
         return f"{self.__class__.__name__}({self._data})"
+
+
+def set_trace_probability(nodes: list[ScyllaNode], probability_value: float) -> None:
+    def _set_trace_probability_for_node(_node: ScyllaNode) -> None:
+        logger.debug(f'{"Enable" if probability_value else "Disable"} trace for {_node.name} with {probability_value=}')
+        _node.cluster.manager.api.set_trace_probability(node_ip=_node.address(), probability=probability_value)
+
+    with ThreadPoolExecutor(max_workers=len(nodes)) as executor:
+        threads = [executor.submit(_set_trace_probability_for_node, node) for node in nodes]
+        [thread.result() for thread in threads]
 
 
 def colored_text(text: str, color: str) -> str:

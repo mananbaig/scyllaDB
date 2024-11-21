@@ -21,18 +21,26 @@ from test.dtest.tools.misc import colored_text
 
 
 pytest_plugins = [
+    "test.conftest",
     "test.topology.conftest",
 ]
 
 logger = logging.getLogger(__name__)
 
 
-def pytest_addoption(parser):
+def pytest_addoption(parser) -> None:
     parser.addoption("--use-vnodes", action="store_true", default=True, help="Determines wither or not to setup clusters using vnodes for tests")
     parser.addoption("--num-tokens", action="store", default=256, help="Number of tokens to set num_tokens yaml setting to when creating instances " "with vnodes enabled")
     parser.addoption("--experimental-features", type=lambda s: s.split(","), action="store", help="Pass experimental features <feature>,<feature> to enable")
     parser.addoption("--tablets", action=argparse.BooleanOptionalAction, default=False, help="Whether to enable tablets support (default: %(default)s)")
     parser.addoption("--force-gossip-topology-changes", action="store_true", default=False, help="force gossip topology changes in a fresh cluster")
+
+
+def pytest_configure() -> None:
+    logging.getLogger("cassandra").setLevel(logging.INFO)
+    logging.getLogger("boto3").setLevel(logging.INFO)
+    logging.getLogger("botocore").setLevel(logging.INFO)
+    logging.getLogger("s3transfer").setLevel(logging.INFO)
 
 
 @pytest.fixture(scope="function", autouse=True)
