@@ -204,13 +204,30 @@ static ss::token_range token_range_endpoints_to_json(const dht::token_range_endp
     return r;
 }
 
-using ks_cf_func = std::function<future<json::json_return_type>(http_context&, std::unique_ptr<http::request>, sstring, std::vector<table_info>)>;
+using ks_cfs_func = std::function<future<json::json_return_type>(http_context&, std::unique_ptr<http::request>, sstring, std::vector<table_info>)>;
 
-static auto wrap_ks_cf(http_context &ctx, ks_cf_func f) {
+static auto wrap_ks_cf(http_context &ctx, ks_cfs_func f) {
     return [&ctx, f = std::move(f)](std::unique_ptr<http::request> req) {
         auto keyspace = validate_keyspace(ctx, req);
         auto table_infos = parse_table_infos(keyspace, ctx, req->query_parameters, "cf");
         return f(ctx, std::move(req), std::move(keyspace), std::move(table_infos));
+    };
+}
+
+using ks_cf_func = std::function<future<json::json_return_type>(http_context&, std::unique_ptr<http::request>, sstring, table_info)>;
+
+static auto wrap_ks_cf(http_context& ctx, ks_cf_func f) {
+    return [&ctx, f = std::move(f)](std::unique_ptr<http::request> req) {
+        auto keyspace = validate_keyspace(ctx, req);
+        auto ti = table_info { .name = req->get_query_param("cf") };
+        if (!ti.name.empty()) {
+            try {
+                ti.id = ctx.db.local().find_uuid(keyspace, ti.name);
+            } catch (replica::no_such_column_family& e) {
+                throw bad_param_exception(e.what());
+            }
+        }
+        return f(ctx, std::move(req), std::move(keyspace), std::move(ti));
     };
 }
 
@@ -468,9 +485,7 @@ void unset_repair(http_context& ctx, routes& r) {
 }
 
 void set_sstables_loader(http_context& ctx, routes& r, sharded<sstables_loader>& sst_loader) {
-    ss::load_new_ss_tables.set(r, [&ctx, &sst_loader](std::unique_ptr<http::request> req) {
-        auto ks = validate_keyspace(ctx, req);
-        auto cf = req->get_query_param("cf");
+    ss::load_new_ss_tables.set(r, wrap_ks_cf(ctx, [&sst_loader](http_context& ctx, std::unique_ptr<http::request> req, sstring keyspace, table_info ti) {
         auto stream = req->get_query_param("load_and_stream");
         auto primary_replica = req->get_query_param("primary_replica_only");
         boost::algorithm::to_lower(stream);
@@ -479,11 +494,11 @@ void set_sstables_loader(http_context& ctx, routes& r, sharded<sstables_loader>&
         bool primary_replica_only = primary_replica == "true" || primary_replica == "1";
         // No need to add the keyspace, since all we want is to avoid always sending this to the same
         // CPU. Even then I am being overzealous here. This is not something that happens all the time.
-        auto coordinator = std::hash<sstring>()(cf) % smp::count;
+        auto coordinator = std::hash<sstring>()(ti.name) % smp::count;
         return sst_loader.invoke_on(coordinator,
-                [ks = std::move(ks), cf = std::move(cf),
+                [ks = std::move(keyspace), ti = std::move(ti),
                 load_and_stream, primary_replica_only] (sstables_loader& loader) {
-            return loader.load_new_sstables(ks, cf, load_and_stream, primary_replica_only);
+            return loader.load_new_sstables(ks, ti.name, load_and_stream, primary_replica_only);
         }).then_wrapped([] (auto&& f) {
             if (f.failed()) {
                 auto msg = fmt::format("Failed to load new sstables: {}", f.get_exception());
@@ -491,7 +506,7 @@ void set_sstables_loader(http_context& ctx, routes& r, sharded<sstables_loader>&
             }
             return make_ready_future<json::json_return_type>(json_void());
         });
-    });
+    }));
 
     ss::start_restore.set(r, [&sst_loader] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
         auto endpoint = req->get_query_param("endpoint");
@@ -631,19 +646,14 @@ void set_storage_service(http_context& ctx, routes& r, sharded<service::storage_
         return ss.local().get_schema_version();
     });
 
-    ss::get_range_to_endpoint_map.set(r, [&ctx, &ss](std::unique_ptr<http::request> req) -> future<json::json_return_type> {
-        auto keyspace = validate_keyspace(ctx, req);
-        auto table = req->get_query_param("cf");
-
+    ss::get_range_to_endpoint_map.set(r, wrap_ks_cf(ctx, [&ss](http_context& ctx, std::unique_ptr<http::request> req, sstring keyspace, table_info ti) -> future<json::json_return_type> {
         auto erm = std::invoke([&]() -> locator::effective_replication_map_ptr {
-            auto& ks = ctx.db.local().find_keyspace(keyspace);
-            if (table.empty()) {
+            if (ti.name.empty()) {
+                auto& ks = ctx.db.local().find_keyspace(keyspace);
                 ensure_tablets_disabled(ctx, keyspace, "storage_service/range_to_endpoint_map");
                 return ks.get_vnode_effective_replication_map();
             } else {
-                validate_table(ctx, keyspace, table);
-
-                auto& cf = ctx.db.local().find_column_family(keyspace, table);
+                auto& cf = ctx.db.local().find_column_family(ti.id);
                 return cf.get_effective_replication_map();
             }
         });
@@ -667,7 +677,7 @@ void set_storage_service(http_context& ctx, routes& r, sharded<service::storage_
             }
             return m;
         });
-    });
+    }));
 
     ss::get_pending_range_to_endpoint_map.set(r, [&ctx](std::unique_ptr<http::request> req) {
         //TBD
@@ -701,11 +711,9 @@ void set_storage_service(http_context& ctx, routes& r, sharded<service::storage_
         });
     });
 
-    ss::get_natural_endpoints.set(r, [&ctx, &ss](const_req req) {
-        auto keyspace = validate_keyspace(ctx, req);
-        return container_to_vec(ss.local().get_natural_endpoints(keyspace, req.get_query_param("cf"),
-                req.get_query_param("key")));
-    });
+    ss::get_natural_endpoints.set(r, wrap_ks_cf(ctx, [&ss](http_context& ctx, std::unique_ptr<http::request> req, sstring keyspace, table_info ti) -> future<json::json_return_type> {
+        return make_ready_future<json::json_return_type>(container_to_vec(ss.local().get_natural_endpoints(keyspace, ti.name, req->get_query_param("key"))));
+    }));
 
     ss::cdc_streams_check_and_repair.set(r, [&ss] (std::unique_ptr<http::request> req) {
         return ss.invoke_on(0, [] (service::storage_service& ss) {
@@ -742,7 +750,7 @@ void set_storage_service(http_context& ctx, routes& r, sharded<service::storage_
         co_return json_void();
     });
 
-    ss::force_keyspace_compaction.set(r, [&ctx](std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+    ss::force_keyspace_compaction.set(r, wrap_ks_cf(ctx, [](http_context& ctx, std::unique_ptr<http::request> req, sstring keyspace, std::vector<table_info> table_infos) -> future<json::json_return_type> {
         auto& db = ctx.db;
         auto params = req_params({
             std::pair("keyspace", mandatory::yes),
@@ -751,8 +759,6 @@ void set_storage_service(http_context& ctx, routes& r, sharded<service::storage_
             std::pair("consider_only_existing_data", mandatory::no),
         });
         params.process(*req);
-        auto keyspace = validate_keyspace(ctx, *params.get("keyspace"));
-        auto table_infos = parse_table_infos(keyspace, ctx, params.get("cf").value_or(""));
         auto flush = params.get_as<bool>("flush_memtables").value_or(true);
         auto consider_only_existing_data = params.get_as<bool>("consider_only_existing_data").value_or(false);
         apilog.info("force_keyspace_compaction: keyspace={} tables={}, flush={} consider_only_existing_data={}", keyspace, table_infos, flush, consider_only_existing_data);
@@ -771,12 +777,10 @@ void set_storage_service(http_context& ctx, routes& r, sharded<service::storage_
         }
 
         co_return json_void();
-    });
+    }));
 
-    ss::force_keyspace_cleanup.set(r, [&ctx, &ss](std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+    ss::force_keyspace_cleanup.set(r, wrap_ks_cf(ctx, [&ss](http_context& ctx, std::unique_ptr<http::request> req, sstring keyspace, std::vector<table_info> table_infos) -> future<json::json_return_type> {
         auto& db = ctx.db;
-        auto keyspace = validate_keyspace(ctx, req);
-        auto table_infos = parse_table_infos(keyspace, ctx, req->query_parameters, "cf");
         const auto& rs = db.local().find_keyspace(keyspace).get_replication_strategy();
         if (rs.get_type() == locator::replication_strategy_type::local || !rs.is_vnode_based()) {
             auto reason = rs.get_type() == locator::replication_strategy_type::local ? "require" : "support";
@@ -801,7 +805,7 @@ void set_storage_service(http_context& ctx, routes& r, sharded<service::storage_
         }
 
         co_return json::json_return_type(0);
-    });
+    }));
 
     ss::cleanup_all.set(r, [&ctx, &ss](std::unique_ptr<http::request> req) -> future<json::json_return_type> {
         apilog.info("cleanup_all");
@@ -869,18 +873,16 @@ void set_storage_service(http_context& ctx, routes& r, sharded<service::storage_
         co_return json_void();
     });
 
-    ss::force_keyspace_flush.set(r, [&ctx](std::unique_ptr<http::request> req) -> future<json::json_return_type> {
-        auto keyspace = validate_keyspace(ctx, req);
-        auto column_families = parse_tables(keyspace, ctx, req->query_parameters, "cf");
-        apilog.info("perform_keyspace_flush: keyspace={} tables={}", keyspace, column_families);
+    ss::force_keyspace_flush.set(r, wrap_ks_cf(ctx, [] (http_context& ctx, std::unique_ptr<http::request> req, sstring keyspace, std::vector<table_info> table_infos) -> future<json::json_return_type> {
+        apilog.info("perform_keyspace_flush: keyspace={} tables={}", keyspace, table_infos);
         auto& db = ctx.db;
-        if (column_families.empty()) {
+        if (table_infos.empty()) {
             co_await replica::database::flush_keyspace_on_all_shards(db, keyspace);
         } else {
-            co_await replica::database::flush_tables_on_all_shards(db, keyspace, std::move(column_families));
+            co_await replica::database::flush_tables_on_all_shards(db, std::move(table_infos));
         }
         co_return json_void();
-    });
+    }));
 
 
     ss::decommission.set(r, [&ss](std::unique_ptr<http::request> req) {
