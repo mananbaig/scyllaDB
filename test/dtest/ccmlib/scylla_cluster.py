@@ -24,10 +24,9 @@ SCYLLA_VERSION_FILE = Path(__file__).parent.parent.parent.parent / "build" / "SC
 
 
 class ScyllaCluster:
-    scylla_mode = "debug"  # TODO: implement this
-
-    def __init__(self, manager: ManagerClient):
+    def __init__(self, manager: ManagerClient, scylla_mode: str):
         self.manager = manager
+        self.scylla_mode = scylla_mode
         self._config_options = {}
 
     @staticmethod

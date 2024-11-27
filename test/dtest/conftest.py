@@ -54,8 +54,13 @@ def fixture_dtest_setup_overrides(dtest_config):
 
 
 @pytest.fixture(scope="function", autouse=False)
-def fixture_dtest_setup(request, dtest_config, fixture_dtest_setup_overrides, manager):
-    dtest_setup = DTestSetup(dtest_config=dtest_config, setup_overrides=fixture_dtest_setup_overrides, manager=manager)
+def fixture_dtest_setup(request, dtest_config, fixture_dtest_setup_overrides, manager, build_mode):
+    dtest_setup = DTestSetup(
+        dtest_config=dtest_config,
+        setup_overrides=fixture_dtest_setup_overrides,
+        manager=manager,
+        scylla_mode=build_mode,
+    )
 
     if request.node.get_closest_marker("single_node") or not request.node.get_closest_marker("no_boot_speedups"):
         dtest_setup.cluster_options.setdefault("skip_wait_for_gossip_to_settle", 0)
