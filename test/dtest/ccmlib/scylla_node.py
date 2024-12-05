@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 import locale
 import subprocess
+from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -16,6 +17,7 @@ from test.dtest.ccmlib.common import ArgumentError
 
 if TYPE_CHECKING:
     from test.pylib.internal_types import ServerInfo
+    from test.pylib.log_browsing import ScyllaLogFile
     from test.dtest.ccmlib.scylla_cluster import ScyllaCluster
 
 
@@ -75,11 +77,100 @@ class ScyllaNode:
 
         return self.network_interfaces["storage"][0]
 
-    def grep_log(self, expr, filter_expr=None, filename='system.log', from_mark=None):  # TODO: implement this
-        return []
+    @cached_property
+    def scylla_log_file(self) -> ScyllaLogFile:
+        return self.cluster.manager.server_open_log(server_id=self.server_id)
 
-    def grep_log_for_errors(self, filename='system.log', distinct_errors=False, search_str=None, case_sensitive=True, from_mark=None):  # TODO: implement this
-        return []
+    def grep_log(self,
+                 expr: str,
+                 filter_expr: str | None = None,
+                 filename: str | None = None,  # not used in scylla-dtest
+                 from_mark: int | None = None) -> list[tuple[str, re.Match[str]]]:
+        assert filename is None, "only ScyllaDB's log is supported"
+
+        return self.scylla_log_file.grep(expr=expr, filter_expr=filter_expr, from_mark=from_mark)
+
+    def grep_log_for_errors(self,
+                            filename: str | None = None,  # not used in scylla-dtest
+                            distinct_errors: bool = False,
+                            search_str: str | None = None,  # not used in scylla-dtest
+                            case_sensitive: bool = True,  # not used in scylla-dtest
+                            from_mark: int | None = None) -> list[str] | list[list[str]]:
+        assert filename is None, "only ScyllaDB's log is supported"
+        assert search_str is None, "argument `search_str` is not supported"
+        assert case_sensitive, "only case sensitive search is supported"
+
+        from_mark = getattr(self, "error_mark", None) if from_mark is None else from_mark
+
+        return self.scylla_log_file.grep_for_errors(distinct_errors=distinct_errors, from_mark=from_mark)
+
+    def mark_log_for_errors(self, filename: str | None = None) -> None:
+        assert filename is None, "only ScyllaDB's log is supported"
+
+        self.error_mark = self.mark_log()
+
+    def mark_log(self, filename: str | None = None) -> int:
+        assert filename is None, "only ScyllaDB's log is supported"
+
+        return self.scylla_log_file.mark()
+
+    def watch_log_for(self,
+                      exprs: str | list[str],
+                      from_mark: int | None = None,
+                      timeout: float = 600,
+                      process: subprocess.Popen | None = None,  # don't use it here
+                      verbose: bool | None = None,  # not used in scylla-dtest
+                      filename: str | None = None,  # not used in scylla-dtest
+                      polling_interval: float | None = None) -> tuple[str, re.Match[str]] | list[tuple[str, re.Match[str]]]:  # not used in scylla-dtest
+        assert process is None, "argument `process` is not supported"
+        assert verbose is None, "argument `verbose` is not supported"
+        assert filename is None, "only ScyllaDB's log is supported"
+        assert polling_interval is None, "argument `polling_interval` is not supported"
+
+        if isinstance(exprs, str):
+            exprs = [exprs]
+
+        _, matches = self.scylla_log_file.wait_for(*exprs, from_mark=from_mark, timeout=timeout)
+
+        return matches[0] if len(matches) == 1 else matches
+
+    def watch_log_for_death(self,
+                            nodes: ScyllaNode | list[ScyllaNode],
+                            from_mark: int | None = None,
+                            timeout: float = 600,
+                            filename: str | None = None) -> None:
+        """Watch the log of this node until it detects that the provided other nodes are marked dead.
+
+        This method returns nothing but throw a TimeoutError if all the requested node have not been found
+        to be marked dead before timeout sec.
+
+        A mark as returned by mark_log() can be used as the `from_mark` parameter to start watching the log
+        from a given position. Otherwise, the log is watched from the beginning.
+        """
+        assert filename is None, "only ScyllaDB's log is supported"
+
+        self.watch_log_for(
+            [f"{n.address()}.* now (dead|DOWN)" for n in (nodes if isinstance(nodes, list) else [nodes])],
+            from_mark=from_mark,
+            timeout=timeout,
+        )
+
+    def watch_log_for_alive(self,
+                            nodes: ScyllaNode | list[ScyllaNode],
+                            from_mark: int | None = None,
+                            timeout: float = 120,
+                            filename: str | None = None) -> None:
+        """Watch the log of this node until it detects that the provided other nodes are marked UP.
+
+        This method works similarly to watch_log_for_death().
+        """
+        assert filename is None, "only ScyllaDB's log is supported"
+
+        self.watch_log_for(
+            [f"{n.address()}.* now UP" for n in (nodes if isinstance(nodes, list) else [nodes])],
+            from_mark=from_mark,
+            timeout=timeout,
+        )
 
     def is_running(self) -> bool:
         return any(self.server_id == s.server_id for s in self.cluster.manager.running_servers())
@@ -165,10 +256,10 @@ class ScyllaNode:
         return self.nodetool(" ".join(cmd), **kwargs)
 
     def drain(self, block_on_log: bool = False) -> None:
-        # mark = self.mark_log()
+        mark = self.mark_log()
         self.nodetool("drain")
-        # if block_on_log:
-        #     self.watch_log_for("DRAINED", from_mark=mark)
+        if block_on_log:
+            self.watch_log_for("DRAINED", from_mark=mark)
 
     def flush(self, ks: str | None = None, table: str | None = None, **kwargs) -> None:
         cmd = ["flush"]

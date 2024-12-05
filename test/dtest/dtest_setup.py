@@ -32,6 +32,7 @@ from test.dtest.tools.log_utils import DisableLogger, remove_control_chars
 from test.dtest.tools.misc import retry_till_success
 
 if TYPE_CHECKING:
+    from test.dtest.ccmlib.scylla_node import ScyllaNode
     from test.dtest.dtest_config import DTestConfig
     from test.dtest.dtest_setup_overrides import DTestSetupOverrides
     from test.pylib.manager_client import ManagerClient
@@ -372,105 +373,112 @@ class DTestSetup:
             **kwargs,
         )
 
-    def check_errors(self, node, exclude_errors=None, search_str=None, from_mark=None, regex=False, return_errors=False):  # noqa: PLR0913
-        if from_mark != None:
-            node.error_mark = from_mark
-        errors = node.grep_log_for_errors(distinct_errors=True, search_str=search_str)
+    def check_errors(self,
+                     node: ScyllaNode,
+                     exclude_errors: str | tuple[str, ...] | list[str] | None = None,
+                     search_str: None = None,  # not used in scylla-dtest
+                     from_mark: int | None = None,  # not used in scylla-dtest
+                     regex: bool = False,
+                     return_errors: bool = False) -> list[str]:
+        assert search_str is None, "argument `search_str` is not supported"
+        assert from_mark is None, "argument `from_mark` is not supported"
 
-        if exclude_errors:
-            if isinstance(exclude_errors, tuple):
+        match exclude_errors:
+            case tuple():
                 exclude_errors = list(exclude_errors)
-            if not isinstance(exclude_errors, list):
+            case list():
+                pass
+            case str():
                 exclude_errors = [exclude_errors]
-            if not regex:
-                exclude_errors = [re.escape(ee) for ee in list(exclude_errors)]
-        errors = list(self.__filter_errors(errors, exclude_errors))
+            case None:
+                exclude_errors = []
+            case _:
+                raise TypeError(f"Unsupported type for `exlude_errors` argument: {type(exclude_errors)}")
 
-        if errors:
-            if not return_errors:
-                assert False, "\n".join(list(errors))
+        if not regex:
+            exclude_errors = [re.escape(error) for error in exclude_errors]
+
+        # Yep, we have such side effect in scylla-dtest.
+        self.ignore_log_patterns += exclude_errors
+
+        exclude_errors_pattern = re.compile("|".join(f"{p}" for p in {
+            *self.ignore_log_patterns,
+            *self.ignore_cores_log_patterns,
+
+            r"Compaction for .* deliberately stopped",
+            r"update compaction history failed:.*ignored",
+
+            # We may stop nodes that have not finished starting yet.
+            r"(Startup|start) failed:.*(seastar::sleep_aborted|raft::request_aborted)",
+            r"Timer callback failed: seastar::gate_closed_exception",
+
+            # Ignore expected RPC errors when nodes are stopped.
+            r"rpc - client .*(connection dropped|fail to connect)",
+
+            # We see benign RPC errors when nodes start/stop.
+            # If they cause system malfunction, it should be detected using higher-level tests.
+            r"rpc::unknown_verb_error",
+            r"raft_rpc - Failed to send",
+            r"raft_topology.*(seastar::broken_promise|rpc::closed_error)",
+
+            # Expected tablet migration stream failure where a node is stopped.
+            # Refs: https://github.com/scylladb/scylladb/issues/19640
+            r"Failed to handle STREAM_MUTATION_FRAGMENTS.*rpc::stream_closed",
+
+            # Expected Raft errors on decommission-abort or node restart with MV.
+            r"raft_topology - raft_topology_cmd.*failed with: raft::request_aborted",
+        }))
+
+        errors = node.grep_log_for_errors(distinct_errors=True)
+        errors = [remove_control_chars(error) for error in errors if not exclude_errors_pattern.search(error)]
 
         if return_errors:
-            return list(errors)
+            return errors
 
-        if exclude_errors:
-            self.ignore_log_patterns += exclude_errors
+        assert not errors, "\n".join(errors)
 
-    def check_errors_all_nodes(self, nodes=None, exclude_errors=None, search_str=None, regex=False):
-        if nodes is None:
-            nodes = self.cluster.nodelist()
+    def check_errors_all_nodes(self,
+                               nodes: list[ScyllaNode] | None = None,  # not used in scylla-dtest
+                               exclude_errors: str | tuple[str, ...] | list[str] | None = None,
+                               search_str: str | None = None,  # not used in scylla-dtest
+                               regex: bool = False) -> None:
+        assert search_str is None, "argument `search_str` is not supported"
+        assert nodes is None, "argument `nodes` is not supported"
 
         critical_errors = []
         found_errors = []
-        for node in nodes:
+
+        logger.debug("exclude_errors: %s", exclude_errors)
+
+        for node in self.cluster.nodelist():
             try:
                 critical_errors_pattern = r"Assertion.*failed|AddressSanitizer"
                 if self.ignore_cores_log_patterns:
-                    expr = "|".join([f"({p})" for p in set(self.ignore_cores_log_patterns)])
-                    matches = node.grep_log(expr)
-                    if matches:
-                        logger.debug(f"Will ignore cores on {node.name}. Found the following log messages: {matches}")
+                    if matches := node.grep_log("|".join(f"({p})" for p in set(self.ignore_cores_log_patterns))):
+                        logger.debug("Will ignore cores on %s. Found the following log messages: %s", node.name, matches)
                         self.ignore_cores.append(node)
                 if node not in self.ignore_cores:
                     critical_errors_pattern += "|Aborting on shard"
-                filter_expr = "|".join(self.ignore_log_patterns)
-                matches = node.grep_log(critical_errors_pattern, filter_expr=filter_expr)
-                if matches:
+                if matches := node.grep_log(critical_errors_pattern, filter_expr="|".join(self.ignore_log_patterns)):
                     critical_errors.append((node.name, [m[0].strip() for m in matches]))
             except FileNotFoundError:
                 pass
-            logger.debug(f"exclude_errors: {exclude_errors}")
-            errors = self.check_errors(node=node, exclude_errors=exclude_errors, search_str=search_str, regex=regex, return_errors=True)
-            if len(errors):
+
+            if errors := self.check_errors(node=node, exclude_errors=exclude_errors, regex=regex, return_errors=True):
                 found_errors.append((node.name, errors))
 
-        if critical_errors:
-            raise AssertionError(f"Critical errors found: {critical_errors}\nOther errors: {found_errors}")
+        assert not critical_errors, f"Critical errors found: {critical_errors}\nOther errors: {found_errors}"
+
         if found_errors:
-            logger.error(f"Unexpected errors found: {found_errors}")
-            errors_summary = "\n".join([f"{node}: {len(errors)} errors\n" + "\n".join(errors[:5]) for node, errors in found_errors])
+            logger.error("Unexpected errors found: %s", found_errors)
+            errors_summary = "\n".join(
+                f"{node}: {len(errors)} errors\n{"\n".join(errors[:5])}" for node, errors in found_errors
+            )
             raise AssertionError(f"Unexpected errors found:\n{errors_summary}")
-        found_cores, ignored_cores = self.find_cores()
-        if found_cores:
-            raise AssertionError("Core file(s) found. Marking test as failed.")
 
-    def __filter_errors(self, errors, patterns=None):
-        """Filter errors, removing those that match patterns"""
-        if not patterns:
-            patterns = []
-        patterns += self.ignore_log_patterns
-        patterns += self.ignore_cores_log_patterns
-        patterns += [
-            r"Compaction for .* deliberately stopped",
-            r"update compaction history failed:.*ignored",
-        ]
-        # ignore expected rpc errors when nodes are stopped.
-        expected_rpc_errors = [
-            "connection dropped",
-            "fail to connect",
-        ]
-        # we may stop nodes that have not finished starting yet
-        patterns += [
-            r"(Startup|start) failed:.*(seastar::sleep_aborted|raft::request_aborted)",
-            r"Timer callback failed: seastar::gate_closed_exception",
-        ]
-        patterns += ["rpc - client .*({})".format("|".join(expected_rpc_errors))]
-        # We see benign rpc errors when nodes start/stop.
-        # If they cause system malfunction, it should be detected using higher-level tests.
-        patterns += [r"rpc::unknown_verb_error"]
-        patterns += ["raft_rpc - Failed to send", r"raft_topology.*(seastar::broken_promise|rpc::closed_error)"]
+        found_cores, _ = self.find_cores()
 
-        # Expected tablet migration stream failure where a node is stopped.
-        # refs: https://github.com/scylladb/scylladb/issues/19640
-        patterns += [r"Failed to handle STREAM_MUTATION_FRAGMENTS.*rpc::stream_closed"]
-
-        # Expected RAFT errors on decommission-abort or node restart with MV.
-        patterns += [r"raft_topology - raft_topology_cmd.*failed with: raft::request_aborted"]
-
-        pattern = re.compile("|".join([f"({p})" for p in set(patterns)]))
-        for e in errors:
-            if not pattern.search(e):
-                yield remove_control_chars(e)
+        assert not found_cores, "Core file(s) found. Marking test as failed."
 
     def supports_v5_protocol(self, cluster_version):
         return cluster_version >= Version("4.0")
