@@ -21,6 +21,7 @@
 #include "partition_slice_builder.hh"
 #include "db/config.hh"
 #include "gms/feature_service.hh"
+#include "schema/schema.hh"
 #include "system_keyspace_view_types.hh"
 #include "schema/schema_builder.hh"
 #include "utils/assert.hh"
@@ -90,6 +91,7 @@ namespace {
             system_keyspace::COMMITLOG_CLEANUPS,
             system_keyspace::SERVICE_LEVELS_V2,
             system_keyspace::VIEW_BUILD_STATUS_V2,
+            system_keyspace::VIEW_BUILDING_COORDINATOR_TASKS,
             system_keyspace::ROLES,
             system_keyspace::ROLE_MEMBERS,
             system_keyspace::ROLE_ATTRIBUTES,
@@ -113,6 +115,7 @@ namespace {
                 system_keyspace::TABLETS,
                 system_keyspace::SERVICE_LEVELS_V2,
                 system_keyspace::VIEW_BUILD_STATUS_V2,
+                system_keyspace::VIEW_BUILDING_COORDINATOR_TASKS,
                 // auth tables
                 system_keyspace::ROLES,
                 system_keyspace::ROLE_MEMBERS,
@@ -1168,6 +1171,22 @@ schema_ptr system_keyspace::view_build_status_v2() {
                 .with_column("view_name", utf8_type, column_kind::partition_key)
                 .with_column("host_id", uuid_type, column_kind::clustering_key)
                 .with_column("status", utf8_type)
+                .with_hash_version()
+                .build();
+    }();
+    return schema;
+}
+
+schema_ptr system_keyspace::view_building_coordinator_tasks() {
+    static thread_local auto schema = [] {
+        auto id = generate_legacy_id(NAME, VIEW_BUILDING_COORDINATOR_TASKS);
+        return schema_builder(NAME, VIEW_BUILDING_COORDINATOR_TASKS, id)
+                .with_column("keyspace_name", utf8_type, column_kind::partition_key)
+                .with_column("view_name", utf8_type, column_kind::partition_key)
+                .with_column("host_id", uuid_type, column_kind::clustering_key)
+                .with_column("shard", int32_type, column_kind::clustering_key)
+                .with_column("start_token", long_type, column_kind::clustering_key)
+                .with_column("end_token", long_type, column_kind::clustering_key)
                 .with_hash_version()
                 .build();
     }();
@@ -2296,6 +2315,7 @@ std::vector<schema_ptr> system_keyspace::all_tables(const db::config& cfg) {
                     v3::cdc_local(),
                     raft(), raft_snapshots(), raft_snapshot_config(), group0_history(), discovery(),
                     topology(), cdc_generations_v3(), topology_requests(), service_levels_v2(), view_build_status_v2(),
+                    view_building_coordinator_tasks()
     });
 
     if (cfg.check_experimental(db::experimental_features_t::feature::BROADCAST_TABLES)) {
