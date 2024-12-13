@@ -316,6 +316,40 @@ future<> run_keyspace_tasks(replica::database& db, std::vector<keyspace_tasks_in
     }
 }
 
+std::optional<double> compaction_task_impl::expected_children_number() const {
+    return _child_count ? std::make_optional<double>(_child_count) : std::nullopt;
+}
+
+future<tasks::task_manager::task::progress> compaction_task_impl::get_progress() const {
+    auto children_num = expected_children_number().value_or(0);
+    if (!children_num) {
+        co_return tasks::task_manager::task::progress{
+            .completed = is_done() ? 100.00 : 0.00,
+            .total = 100.00
+        };
+    }
+
+    auto progress = co_await _children.get_progress([] (tasks::task_manager::task::progress& res, const tasks::task_manager::task::progress& child_progress) {
+            res.completed += 100.00 * child_progress.completed / child_progress.total;
+        }, [type = type()] (tasks::task_manager::task::child_variant child_v) {
+            return std::visit(overloaded_functor{
+                [&type] (tasks::task_manager::task_ptr child) {
+                    return type.find(child->type()) != std::string::npos;
+                },
+                [&type] (tasks::task_manager::task::task_essentials child) {
+                    return type.find(child.type) != std::string::npos;
+                }
+            }, child_v);
+        }, tasks::task_manager::task::progress{
+            .completed = 0.0,
+            .total = 100.00
+        }
+    );
+    progress.completed /= children_num; // Each child has an equal participation.
+    progress.total = 100.00;
+    co_return progress;
+}
+
 future<tasks::task_manager::task::progress> compaction_task_impl::get_progress(const sstables::compaction_data& cdata, const sstables::compaction_progress_monitor& progress_monitor) const {
     if (cdata.compaction_size == 0) {
         co_return get_binary_progress();
