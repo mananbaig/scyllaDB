@@ -433,6 +433,7 @@ future<> major_keyspace_compaction_task_impl::run() {
         flushed_all_tables = co_await maybe_flush_commitlog(_db, _consider_only_existing_data);
     }
 
+    _child_count = smp::count;
     flush_mode fm = flushed_all_tables ? flush_mode::skip : _flush_mode;
     co_await _db.invoke_on_all([&] (replica::database& db) -> future<> {
         tasks::task_info parent_info{_status.id, _status.shard};
@@ -470,6 +471,7 @@ tasks::is_user_task cleanup_keyspace_compaction_task_impl::is_user_task() const 
 }
 
 future<> cleanup_keyspace_compaction_task_impl::run() {
+    _child_count = smp::count;
     co_await _db.invoke_on_all([&] (replica::database& db) -> future<> {
         if (_flush_mode == flush_mode::all_tables) {
             co_await db.flush_all_tables();
@@ -550,6 +552,7 @@ tasks::is_user_task offstrategy_keyspace_compaction_task_impl::is_user_task() co
 }
 
 future<> offstrategy_keyspace_compaction_task_impl::run() {
+    _child_count = smp::count;
     bool res = co_await _db.map_reduce0([&] (replica::database& db) -> future<bool> {
         bool needed = false;
         tasks::task_info parent_info{_status.id, _status.shard};
@@ -590,6 +593,7 @@ tasks::is_user_task upgrade_sstables_compaction_task_impl::is_user_task() const 
 }
 
 future<> upgrade_sstables_compaction_task_impl::run() {
+    _child_count = smp::count;
     co_await _db.invoke_on_all([&] (replica::database& db) -> future<> {
         tasks::task_info parent_info{_status.id, _status.shard};
         auto& compaction_module = db.get_compaction_manager().get_task_manager_module();
@@ -636,6 +640,7 @@ tasks::is_user_task scrub_sstables_compaction_task_impl::is_user_task() const no
 }
 
 future<> scrub_sstables_compaction_task_impl::run() {
+    _child_count = smp::count;
     auto res = co_await _db.map_reduce0([&] (replica::database& db) -> future<sstables::compaction_stats> {
         sstables::compaction_stats stats;
         tasks::task_info parent_info{_status.id, _status.shard};
