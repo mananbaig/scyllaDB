@@ -447,6 +447,7 @@ future<> shard_major_keyspace_compaction_task_impl::run() {
     tasks::task_manager::task_ptr current_task;
     tasks::task_info parent_info{_status.id, _status.shard};
     std::vector<table_tasks_info> table_tasks;
+    _child_count = _local_tables.size();
     for (auto& ti : _local_tables) {
         table_tasks.emplace_back(co_await _module->make_and_start_task<table_major_keyspace_compaction_task_impl>(parent_info, _status.keyspace, ti.name, _status.id, _db, ti, cv, current_task, _flush_mode, _consider_only_existing_data), ti);
     }
@@ -517,6 +518,7 @@ future<> shard_cleanup_keyspace_compaction_task_impl::run() {
     tasks::task_manager::task_ptr current_task;
     tasks::task_info parent_info{_status.id, _status.shard};
     std::vector<table_tasks_info> table_tasks;
+    _child_count = _local_tables.size();
     for (auto& ti : _local_tables) {
         table_tasks.emplace_back(co_await _module->make_and_start_task<table_cleanup_keyspace_compaction_task_impl>(parent_info, _status.keyspace, ti.name, _status.id, _db, ti, cv, current_task), ti);
     }
@@ -566,6 +568,7 @@ future<> shard_offstrategy_keyspace_compaction_task_impl::run() {
     tasks::task_manager::task_ptr current_task;
     tasks::task_info parent_info{_status.id, _status.shard};
     std::vector<table_tasks_info> table_tasks;
+    _child_count = _table_infos.size();
     for (auto& ti : _table_infos) {
         table_tasks.emplace_back(co_await _module->make_and_start_task<table_offstrategy_keyspace_compaction_task_impl>(parent_info, _status.keyspace, ti.name, _status.id, _db, ti, cv, current_task, _needed), ti);
     }
@@ -600,6 +603,7 @@ future<> shard_upgrade_sstables_compaction_task_impl::run() {
     tasks::task_manager::task_ptr current_task;
     tasks::task_info parent_info{_status.id, _status.shard};
     std::vector<table_tasks_info> table_tasks;
+    _child_count = _table_infos.size();
     for (auto& ti : _table_infos) {
         table_tasks.emplace_back(co_await _module->make_and_start_task<table_upgrade_sstables_compaction_task_impl>(parent_info, _status.keyspace, ti.name, _status.id, _db, ti, cv, current_task, _exclude_current_version), ti);
     }
@@ -646,6 +650,7 @@ future<> scrub_sstables_compaction_task_impl::run() {
 }
 
 future<> shard_scrub_sstables_compaction_task_impl::run() {
+    _child_count = _column_families.size();
     _stats = co_await map_reduce(_column_families, [&] (sstring cfname) -> future<sstables::compaction_stats> {
         sstables::compaction_stats stats{};
         tasks::task_info parent_info{_status.id, _status.shard};
