@@ -14,6 +14,7 @@
 #include <rapidxml.h>
 #include <seastar/core/coroutine.hh>
 #include <seastar/http/request.hh>
+#include <seastar/util/closeable.hh>
 #include <seastar/util/short_streams.hh>
 
 namespace aws {
@@ -54,6 +55,7 @@ future<> sts_assume_role_credentials_provider::update_credentials() {
     req.query_parameters["RoleArn"] = role_arn;
     auto factory = std::make_unique<utils::http::dns_connection_factory>(sts_host, port, is_secured, sts_logger);
     retryable_http_client http_client(std::move(factory), 1, [](std::exception_ptr) {}, http::experimental::client::retry_requests::yes, retry_strategy);
+    auto close_client = deferred_close(http_client);
     co_return co_await http_client.make_request(
         std::move(req),
         [this](const http::reply&, input_stream<char>&& in) -> future<> {

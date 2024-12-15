@@ -12,6 +12,7 @@
 #include <rapidjson/document.h>
 #include <rapidjson/error/en.h>
 #include <seastar/http/request.hh>
+#include <seastar/util/closeable.hh>
 #include <seastar/util/short_streams.hh>
 
 
@@ -40,6 +41,7 @@ future<> instance_profile_credentials_provider::reload() {
 future<> instance_profile_credentials_provider::update_credentials() {
     auto factory = std::make_unique<utils::http::dns_connection_factory>(ec2_metadata_ip, port, false, ec2_md_logger);
     retryable_http_client http_client(std::move(factory), 1, [](std::exception_ptr) {}, http::experimental::client::retry_requests::yes, retry_strategy);
+    auto close_client = deferred_close(http_client);
 
     auto req = http::request::make("PUT", ec2_metadata_ip, "/latest/api/token");
     req._headers["x-aws-ec2-metadata-token-ttl-seconds"] = format("{}", session_duration);
