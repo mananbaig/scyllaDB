@@ -48,6 +48,7 @@ target_sources(utils
     aws_sigv4.cc
     s3/aws_error.cc
     s3/client.cc
+    s3/retryable_http_client.cc
     s3/retry_strategy.cc
     s3/credentials_providers/config_file_aws_credentials_provider.cc
     s3/credentials_providers/environment_aws_credentials_provider.cc
