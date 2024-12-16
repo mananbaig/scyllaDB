@@ -674,6 +674,11 @@ future<> table_scrub_sstables_compaction_task_impl::run() {
     });
 }
 
+future<tasks::task_manager::task::progress> reshaping_compaction_task_impl::get_progress() const {
+    return _children.get_progress([] (tasks::task_manager::task::progress& res, const tasks::task_manager::task::progress& child_progress) { res += child_progress; },
+        [] (tasks::task_manager::task::child_variant) { return true; }, tasks::task_manager::task::progress{});
+}
+
 future<> table_reshaping_compaction_task_impl::run() {
     auto start = std::chrono::steady_clock::now();
     auto total_size = co_await _dir.map_reduce0([&] (sstables::sstable_directory& d) -> future<uint64_t> {
