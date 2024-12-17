@@ -19,6 +19,8 @@
 #include <seastar/testing/test_runner.hh>
 
 #include "locator/token_metadata.hh"
+#include "test/lib/log.hh"
+#include "test/lib/random_utils.hh"
 
 struct sort_by_proximity_topology {
     static constexpr size_t DCS = 1;
@@ -59,6 +61,8 @@ struct sort_by_proximity_topology {
                     }
                 }
             }
+            auto seed = tests::random::get_int<locator::topology::random_engine_type::result_type>();
+            topology.seed_random_engine(seed);
         });
     }
 };

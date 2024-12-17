@@ -6,11 +6,14 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include <bit>
+#include <ranges>
+#include <utility>
+
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/core/on_internal_error.hh>
 #include <seastar/util/lazy.hh>
-#include <utility>
 
 #include "seastar/core/shard_id.hh"
 #include "utils/log.hh"
@@ -108,6 +111,7 @@ topology::topology(config cfg)
         : _shard(this_shard_id())
         , _cfg(cfg)
         , _sort_by_proximity(!cfg.disable_proximity_sorting)
+        , _random_engine(std::random_device{}())
 {
     tlogger.trace("topology[{}]: constructing using config: endpoint={} id={} dc={} rack={}", fmt::ptr(this),
             cfg.this_endpoint, cfg.this_host_id, cfg.local_dc_rack.dc, cfg.local_dc_rack.rack);
@@ -127,6 +131,7 @@ topology::topology(topology&& o) noexcept
     , _dc_racks(std::move(o._dc_racks))
     , _sort_by_proximity(o._sort_by_proximity)
     , _datacenters(std::move(o._datacenters))
+    , _random_engine(std::move(o._random_engine))
 {
     SCYLLA_ASSERT(_shard == this_shard_id());
     tlogger.trace("topology[{}]: move from [{}]", fmt::ptr(this), fmt::ptr(&o));
@@ -178,6 +183,7 @@ future<topology> topology::clone_gently() const {
         co_await coroutine::maybe_yield();
     }
     ret._sort_by_proximity = _sort_by_proximity;
+    ret._random_engine = _random_engine;
     co_return ret;
 }
 
@@ -585,6 +591,19 @@ void topology::do_sort_by_proximity(locator::host_id address, host_id_vector_rep
         return info{ id, distance(address, loc, id, loc1) };
     }), std::back_inserter(host_infos));
     std::ranges::sort(host_infos, std::ranges::less{}, std::mem_fn(&info::distance));
+    auto it = host_infos.begin();
+    auto prev = it;
+    auto shuffler = _random_engine();
+    for (++it; it < host_infos.end(); ++it) {
+        // Shuffle equal-distance replicas to improve load-balancing
+        if (prev->distance == it->distance) {
+            if (shuffler & 1) {
+                std::swap(prev->id, it->id);
+            }
+            shuffler = std::rotr(shuffler, 1);
+        }
+        prev = it;
+    }
     std::ranges::copy(host_infos | std::ranges::views::transform(std::mem_fn(&info::id)), addresses.begin());
 }
 
@@ -635,6 +654,10 @@ topology::get_datacenter_host_ids() const {
         ret[dc] = nodes | std::views::transform([] (const node& n) { return n.host_id(); }) | std::ranges::to<std::unordered_set>();
     }
     return ret;
+}
+
+void topology::seed_random_engine(random_engine_type::result_type value) {
+    _random_engine.seed(value);
 }
 
 } // namespace locator
