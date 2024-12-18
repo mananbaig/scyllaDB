@@ -54,6 +54,7 @@
 #include "utils/error_injection.hh"
 #include "db/schema_tables.hh"
 #include "utils/rjson.hh"
+#include "db/system_keyspace.hh"
 
 using namespace std::chrono_literals;
 
@@ -468,7 +469,48 @@ static rjson::value generate_arn_for_index(const schema& schema, std::string_vie
         schema.ks_name(), schema.cf_name(), index_name));
 }
 
-static rjson::value fill_table_description(schema_ptr schema, table_status tbl_status, service::storage_proxy const& proxy)
+// The following function returns the set of fully-built views in the given
+// keyspace. We need this for describe_table() to know if a view is still
+// backfilling, or active. Sadly, currently we don't cache in memory whether
+// a view finished building long ago - so checking the built views involves
+// an inefficient distributed request into a system table.
+static future<std::set<std::string>> list_built_views(
+        service::storage_proxy& proxy,
+        std::string_view keyspace_name,
+        service::client_state& client_state,
+        tracing::trace_state_ptr trace_state,
+        service_permit permit) {
+    // The built_views system table has keyspace_name as the partition key,
+    // and view_name as the clustering key. We scan a single partition and
+    // return the list of view_name values.
+    auto schema = proxy.data_dictionary().find_table("system", db::system_keyspace::v3::BUILT_VIEWS).schema();
+    partition_key pk = partition_key::from_singular_bytes(*schema, utf8_type->decompose(keyspace_name));
+    dht::partition_range_vector partition_ranges{dht::partition_range(dht::decorate_key(*schema, pk))};
+    auto selection = cql3::selection::selection::wildcard(schema);
+    auto partition_slice = query::partition_slice({query::clustering_range::make_open_ended_both_sides()}, {}, {}, selection->get_query_options());
+    auto command = ::make_lw_shared<query::read_command>(
+        schema->id(), schema->version(), partition_slice,
+        proxy.get_max_result_size(partition_slice),
+        query::tombstone_limit(proxy.get_tombstone_limit()));
+    service::storage_proxy::coordinator_query_result qr =
+        co_await proxy.query(
+            schema, std::move(command), std::move(partition_ranges),
+            db::consistency_level::ONE,
+            service::storage_proxy::coordinator_query_options(
+                executor::default_timeout(), std::move(permit), client_state, trace_state));
+    query::result_set rs = query::result_set::from_raw_result(
+        schema, partition_slice, *qr.query_result);
+    std::set<std::string> ret;
+    for (auto&& r : rs.rows()) {
+        std::optional<sstring> view_name = r.get<sstring>("view_name");
+        if (view_name) {
+            ret.emplace(*view_name);
+        }
+    }
+    co_return ret;
+}
+
+static future<rjson::value> fill_table_description(schema_ptr schema, table_status tbl_status, service::storage_proxy& proxy, service::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit)
 {
     rjson::value table_description = rjson::empty_object();
     auto tags_ptr = db::get_tags_of_table(schema);
@@ -528,6 +570,8 @@ static rjson::value fill_table_description(schema_ptr schema, table_status tbl_s
         if (!t.views().empty()) {
             rjson::value gsi_array = rjson::empty_array();
             rjson::value lsi_array = rjson::empty_array();
+            std::set<std::string> built_views = co_await list_built_views(
+                proxy, schema->ks_name(), client_state, trace_state, permit);
             for (const view_ptr& vptr : t.views()) {
                 rjson::value view_entry = rjson::empty_object();
                 const sstring& cf_name = vptr->cf_name();
@@ -547,7 +591,22 @@ static rjson::value fill_table_description(schema_ptr schema, table_status tbl_s
                 // FIXME: we have to get ProjectionType from the schema when it is added
                 rjson::add(view_entry, "Projection", std::move(projection));
                 // Local secondary indexes are marked by an extra '!' sign occurring before the ':' delimiter
-                rjson::value& index_array = (delim_it > 1 && cf_name[delim_it-1] == '!') ? lsi_array : gsi_array;
+                bool is_lsi = (delim_it > 1 && cf_name[delim_it-1] == '!');
+                // Add IndexStatus and Backfilling flags, but only for GSIs -
+                // LSIs can only be created with the table itself and do not
+                // have a status. Alternator schema operations are synchronous
+                // so only two combinations of these flags are possible: ACTIVE
+                // (for a built view) or CREATING+Backfilling (if view building
+                // is in progress).
+                if (!is_lsi) {
+                    if (built_views.contains(cf_name)) {
+                        rjson::add(view_entry, "IndexStatus", "ACTIVE");
+                    } else {
+                        rjson::add(view_entry, "IndexStatus", "CREATING");
+                        rjson::add(view_entry, "Backfilling", rjson::value(true));
+                    }
+                }
+                rjson::value& index_array = is_lsi ? lsi_array : gsi_array;
                 rjson::push_back(index_array, std::move(view_entry));
             }
             if (!lsi_array.Empty()) {
@@ -571,7 +630,7 @@ static rjson::value fill_table_description(schema_ptr schema, table_status tbl_s
     executor::supplement_table_stream_info(table_description, *schema, proxy);
 
     // FIXME: still missing some response fields (issue #5026)
-    return table_description;
+    co_return table_description;
 }
 
 bool is_alternator_keyspace(const sstring& ks_name) {
@@ -590,11 +649,11 @@ future<executor::request_return_type> executor::describe_table(client_state& cli
 
     tracing::add_table_name(trace_state, schema->ks_name(), schema->cf_name());
 
-    rjson::value table_description = fill_table_description(schema, table_status::active, _proxy);
+    rjson::value table_description = co_await fill_table_description(schema, table_status::active, _proxy, client_state, trace_state, permit);
     rjson::value response = rjson::empty_object();
     rjson::add(response, "Table", std::move(table_description));
     elogger.trace("returning {}", response);
-    return make_ready_future<executor::request_return_type>(make_jsonable(std::move(response)));
+    co_return make_jsonable(std::move(response));
 }
 
 // Check CQL's Role-Based Access Control (RBAC) permission_to_check (MODIFY,
@@ -655,7 +714,7 @@ future<executor::request_return_type> executor::delete_table(client_state& clien
     auto& p = _proxy.container();
 
     schema_ptr schema = get_table(_proxy, request);
-    rjson::value table_description = fill_table_description(schema, table_status::deleting, _proxy);
+    rjson::value table_description = co_await fill_table_description(schema, table_status::deleting, _proxy, client_state, trace_state, permit);
     co_await verify_permission(_enforce_authorization, client_state, schema, auth::permission::DROP);
     co_await _mm.container().invoke_on(0, [&, cs = client_state.move_to_other_shard()] (service::migration_manager& mm) -> future<> {
         // FIXME: the following needs to be in a loop. If mm.announce() below
