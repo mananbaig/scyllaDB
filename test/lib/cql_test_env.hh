@@ -105,6 +105,7 @@ public:
 
 struct cql_test_init_configurables {
     db::extensions* extensions{nullptr};
+    std::optional<std::filesystem::path> tmp_dir_path;
 };
 
 class cql_test_env {

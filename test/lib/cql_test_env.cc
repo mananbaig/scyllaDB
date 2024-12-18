@@ -479,7 +479,11 @@ private:
             if (!cfg->view_update_reader_concurrency_semaphore_kill_limit_multiplier.is_set()) {
                 cfg->view_update_reader_concurrency_semaphore_kill_limit_multiplier.set(std::numeric_limits<uint32_t>::max());
             }
-            tmpdir data_dir;
+            fs::path temp_dir_path = fs::temp_directory_path();
+            if (init_configurables.tmp_dir_path) {
+                temp_dir_path = *init_configurables.tmp_dir_path;
+            }
+            tmpdir data_dir(temp_dir_path);
             auto data_dir_path = data_dir.path().string();
             if (!cfg->data_file_directories.is_set()) {
                 cfg->data_file_directories.set({data_dir_path});
