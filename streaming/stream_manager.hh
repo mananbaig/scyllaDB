@@ -189,6 +189,8 @@ private:
 
 public:
     void update_finished_percentage(streaming::stream_reason reason, float percentage);
+
+    future<> fail_stream_plan(streaming::plan_id plan_id);
 };
 
 } // namespace streaming
