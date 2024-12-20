@@ -9,7 +9,7 @@ import pytest
 
 from test.pylib.internal_types import ServerInfo
 from test.pylib.manager_client import ManagerClient
-from test.pylib.repair import create_table_insert_data_for_repair
+from test.pylib.repair import create_table_insert_data_for_repair, get_tablet_task_id
 from test.pylib.tablets import get_all_tablet_replicas
 from test.topology.conftest import skip_mode
 from test.topology_experimental_raft.test_tablets import inject_error_on
@@ -280,3 +280,51 @@ async def test_tablet_migration_task_failed(manager: ManagerClient):
     src = replicas[0].replicas[0]
     dst = (src[0], 1 - src[1])
     await asyncio.gather(move_tablet(src, dst), check("intranode_migration", log, mark))
+
+@pytest.mark.asyncio
+@skip_mode('release', 'error injections are not supported in release mode')
+async def test_repair_task_info_is_none_when_no_running_repair(manager: ManagerClient):
+    module_name = "tablets"
+    tm = TaskManagerClient(manager.api)
+    token = -1
+
+    servers, cql, hosts, table_id = await create_table_insert_data_for_repair(manager)
+    assert module_name in await tm.list_modules(servers[0].ip_addr), "tablets module wasn't registered"
+
+    async def check_none():
+        tablet_task_id = await get_tablet_task_id(cql, hosts[0], table_id, token)
+        assert tablet_task_id is None
+
+    await check_none()
+
+    async def repair_task():
+        await enable_injection(manager, servers, "repair_tablet_fail_on_rpc_call")
+        await manager.api.tablet_repair(servers[0].ip_addr, "test", "test", token)
+
+    async def wait_and_check_none():
+        task = (await wait_tasks_created(tm, servers[0], module_name, 1,"user_repair"))[0]
+        await disable_injection(manager, servers, "repair_tablet_fail_on_rpc_call")
+        status = await tm.wait_for_task(servers[0].ip_addr, task.task_id)
+        await check_none()
+
+    await asyncio.gather(repair_task(), wait_and_check_none())
+
+@pytest.mark.asyncio
+@skip_mode('release', 'error injections are not supported in release mode')
+async def test_tablet_task_sees_latest_state(manager: ManagerClient):
+    servers, cql, hosts, table_id = await create_table_insert_data_for_repair(manager)
+
+    token = -1
+    async def repair_task():
+        await inject_error_on(manager, "repair_tablet_fail_on_rpc_call", servers)
+        # Check failed repair request can be deleted
+        await manager.api.tablet_repair(servers[0].ip_addr, "test", "test", token)
+
+    async def del_repair_task():
+        tablet_task_id = None
+        while tablet_task_id is None:
+            tablet_task_id = await get_tablet_task_id(cql, hosts[0], table_id, token)
+
+        await manager.api.abort_task(servers[0].ip_addr, tablet_task_id)
+
+    await asyncio.gather(repair_task(), del_repair_task())
